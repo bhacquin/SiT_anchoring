@@ -1,0 +1,12 @@
+torch>=2.0
+torchvision
+diffusers
+transformers
+datasets
+accelerate
+wandb
+torchmetrics
+Pillow
+hydra-core
+torch-fidelity
+git+https://github.com/facebookresearch/flow_matching.git

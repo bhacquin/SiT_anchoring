@@ -1,7 +1,13 @@
 __pycache__
 wandb
-
+*.pt
 .DS_store
 samples
 results
 pretrained_models
+outputs/
+configs/
+config/
+*.yaml
+*.out
+*.err

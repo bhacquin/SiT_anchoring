@@ -117,27 +117,47 @@ class Transport:
         self, 
         model,  
         x1, 
-        model_kwargs=None
+        model_kwargs=None,
+        k=1
     ):
         """Loss for training the score model
         Args:
         - model: backbone model; could be score, noise, or velocity
         - x1: datapoint
         - model_kwargs: additional arguments for the model
+        - k: number of noisy samples per clean image for contrastive learning
         """
         if model_kwargs == None:
             model_kwargs = {}
+        B, C, H, W = x1.shape
+        device = x1.device
+        # Repeat x1 k times for k different samples
+        if k > 1:
+            x1_expanded = x0.unsqueeze(1).expand(-1, k, -1, -1, -1)  # (B, k, C, H, W)
+            x_1_flat = x_t.reshape(-1, C, H, W)
+            # x1_expanded = x1.repeat(k, 1, 1, 1)  # (batch_size * k, C, H, W)
+            # Repeat model_kwargs if needed
+            expanded_model_kwargs = {}
+            for key, value in model_kwargs.items():
+                if hasattr(value, 'repeat'):
+                    expanded_model_kwargs[key] = value.repeat(k)
+                else:
+                    expanded_model_kwargs[key] = value
+        else:
+            x_1_flat = x1
+            expanded_model_kwargs = model_kwargs
         
-        t, x0, x1 = self.sample(x1)
-        t, xt, ut = self.path_sampler.plan(t, x0, x1)
-        model_output = model(xt, t, **model_kwargs)
+        # Standard diffusion sampling
+        t, x0, x1_current = self.sample(x_1_flat)
+        t, xt, ut = self.path_sampler.plan(t, x0, x1_current)
+        model_output = model(xt, t, **expanded_model_kwargs)
         B, *_, C = xt.shape
         assert model_output.size() == (B, *xt.size()[1:-1], C)
 
         terms = {}
         terms['pred'] = model_output
         if self.model_type == ModelType.VELOCITY:
-            terms['loss'] = mean_flat(((model_output - ut) ** 2))
+            loss = mean_flat(((model_output - ut) ** 2))
         else: 
             _, drift_var = self.path_sampler.compute_drift(xt, t)
             sigma_t, _ = self.path_sampler.compute_sigma_t(path.expand_t_like_x(t, xt))
@@ -151,9 +171,14 @@ class Transport:
                 raise NotImplementedError()
             
             if self.model_type == ModelType.NOISE:
-                terms['loss'] = mean_flat(weight * ((model_output - x0) ** 2))
+                loss = mean_flat(weight * ((model_output - x0) ** 2))
             else:
-                terms['loss'] = mean_flat(weight * ((model_output * sigma_t + x0) ** 2))
+                loss = mean_flat(weight * ((model_output * sigma_t + x0) ** 2))
+        
+        # Ensure loss is a scalar (important when k > 1)
+        if loss.numel() > 1:
+            loss = loss.mean()
+        terms['loss'] = loss
                 
         return terms
     
