@@ -29,7 +29,7 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 from datasets import load_dataset
 
-from utils import get_config_info, get_layer_by_name
+from utils import get_config_info, get_layer_by_name, compute_entropy
 from models import SiT_models
 from download import find_model
 from transport import create_transport, Sampler
@@ -100,13 +100,13 @@ def cleanup():
         dist.destroy_process_group()
 
 
-def create_logger(logging_dir):
+def create_logger(logging_dir, level=logging.INFO):
     """
     Create a logger that writes to a log file and stdout.
     """
     if dist.get_rank() == 0:  # real logger
         logging.basicConfig(
-            level=logging.INFO,
+            level=level,
             format='[\033[34m%(asctime)s\033[0m] %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S',
             handlers=[logging.StreamHandler(), logging.FileHandler(f"{logging_dir}/log.txt")]
@@ -232,7 +232,17 @@ def main(cfg: DictConfig):
         experiment_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
         checkpoint_dir = f"{experiment_dir}/checkpoints"
         os.makedirs(checkpoint_dir, exist_ok=True)
-        logger = create_logger(experiment_dir)
+        if cfg.logging_level == 'debug':
+            logger = create_logger(experiment_dir, level=logging.DEBUG)
+        elif cfg.logging_level == 'info':
+            logger = create_logger(experiment_dir, level=logging.INFO)
+        elif cfg.logging_level == 'warning':
+            logger = create_logger(experiment_dir, level=logging.WARNING)
+        elif cfg.logging_level == 'error':
+            logger = create_logger(experiment_dir, level=logging.ERROR)
+        else:
+            logger = create_logger(experiment_dir, level=logging.INFO)
+        
         logger.info(f"Experiment directory created at {experiment_dir}")
         logger.info(f"Configuration:\n{OmegaConf.to_yaml(cfg)}")
         # if cfg.wandb:
@@ -259,7 +269,20 @@ def main(cfg: DictConfig):
     model.to(device)
     if cfg.ckpt is not None:
         ckpt_path = cfg.ckpt
-        checkpoint = torch.load(ckpt_path)
+        try:
+            # Essayer d'abord avec weights_only=True (sécurisé)
+            checkpoint = torch.load(ckpt_path, weights_only=True, map_location='cpu')
+            if rank == 0:
+                if logger:
+                    logger.info("✅ Checkpoint loaded with weights_only=True")
+        except Exception as e:
+            # Si ça échoue (à cause de cfg), fallback vers weights_only=False
+            if rank == 0 and logger:
+                logger.warning(f"⚠️ Failed to load with weights_only=True: {str(e)}")
+                logger.warning("Falling back to weights_only=False. Ensure checkpoint is trusted.")
+            checkpoint = torch.load(ckpt_path, weights_only=False, map_location='cpu')
+        
+        # checkpoint = torch.load(ckpt_path, weights_only=False, map_location='cpu')  # Use weights_only=False to load the full model state
         model.load_state_dict(checkpoint["model"])
         ema.load_state_dict(checkpoint["ema"])
         # Note: optimizer will be created after this, so we'll load its state later
@@ -437,9 +460,32 @@ def main(cfg: DictConfig):
             logger.info(f"   - Warmup for {cfg.warmup_steps} steps, from {cfg.warmup_init_lr} to {cfg.learning_rate}")
         if getattr(cfg, 'use_scheduler', False):
             logger.info(f"   - Main scheduler: {cfg.scheduler_type}")
+    # Si on charge un checkpoint, récupérer le train_steps d'abord
+    if cfg.ckpt is not None and "train_steps" in checkpoint:
+        train_steps = checkpoint["train_steps"]
+        if rank == 0 and logger:
+            logger.info(f"✅ Resuming training from step {train_steps}")
+    else:
+        train_steps = 0
+
+    # Avancer le scheduler au bon endroit si on resume
+    if cfg.ckpt is not None and train_steps > 0:
+        if lr_scheduler and scheduler_update_mode == "step":
+            # Avancer le scheduler de train_steps
+            for _ in range(train_steps):
+                lr_scheduler.step()
+            if rank == 0 and logger:
+                logger.info(f"✅ Scheduler advanced to step {train_steps}")
+        elif lr_scheduler:
+            # Pour les schedulers basés sur epochs
+            completed_epochs = train_steps // len(loader)
+            for _ in range(completed_epochs):
+                lr_scheduler.step()
+            if rank == 0 and logger:
+                logger.info(f"✅ Scheduler advanced to epoch {completed_epochs}")
+       
     # Load checkpoint states if resuming
     if cfg.ckpt is not None:
-        # ... (code de chargement du modèle, ema, opt) ...
         # Load scheduler state
         if lr_scheduler and "scheduler" in checkpoint and checkpoint["scheduler"] is not None:
             lr_scheduler.load_state_dict(checkpoint["scheduler"])
@@ -452,7 +498,6 @@ def main(cfg: DictConfig):
     ema.eval()  # EMA model should always be in eval mode
 
     # Variables for monitoring/logging purposes:
-    train_steps = 0
     log_steps = 0
     running_loss = 0
     start_time = time()
@@ -519,42 +564,61 @@ def main(cfg: DictConfig):
                 # Utiliser directement les activations capturées
                 # all_activations[0] contient toutes les activations de forme (batch_size * k_samples, feature_dim)
                 features = layer_outputs[0]
+                B_times_k, number_of_patches, internal_dim = features.shape
                 layer_outputs.clear()
                 batch_size = x_clean.size(0)
+                activations = features.view(batch_size, k_samples, number_of_patches, internal_dim) 
+
                 # Vérification précoce des activations du modèle
-                if not torch.isfinite(features).all():
+                if not torch.isfinite(activations).all():
                     if logger:
-                        logger.error(f"Non-finite activations from model! NaN count: {torch.isnan(features).sum()}, Inf count: {torch.isinf(features).sum()}")
-                        logger.error(f"Activation stats: min={features.min():.6f}, max={features.max():.6f}, mean={features.mean():.6f}")
+                        logger.error(f"Non-finite activations from model! NaN count: {torch.isnan(activations).sum()}, Inf count: {torch.isinf(activations).sum()}")
+                        logger.error(f"Activation stats: min={activations.min():.6f}, max={activations.max():.6f}, mean={activations.mean():.6f}")
                     # Nettoyer les activations
-                    features = torch.nan_to_num(features, nan=0.0, posinf=10.0, neginf=-10.0)
+                    activations = torch.nan_to_num(activations, nan=0.0, posinf=10.0, neginf=-10.0)
                     # Optionnel: clamper pour éviter des valeurs extrêmes
-                    features = torch.clamp(features, -10.0, 10.0)
+                    activations = torch.clamp(activations, -10.0, 10.0)
+
+                ## Entropy logging
+                if getattr(cfg, 'log_entropy', False) and train_steps % cfg.log_entropy_every == 0:
+                    if logger:
+                        logger.debug(f"Calculating entropy for activations of shape {activations.shape}")
+                    entropy_vectors = activations.reshape(-1, activations.shape[-1]*activations.shape[-2])
+                    entropy_mlp = compute_entropy(entropy_vectors)
+                    if logger and rank == 0:
+                        logger.info(f"Entropy (activation): {entropy_mlp:.6f} at step {train_steps}")
+                        log_dict = {"train/entropy_activation": entropy_mlp}
+                        if cfg.wandb:
+                            wandb_utils.log(log_dict, step=train_steps)
+
                 # Debug: vérifier les gradients avant la perte contrastive
-                if cfg.get('debug_contrastive', False):
-                    print(f"[DEBUG] features.requires_grad: {features.requires_grad}")
-                    print(f"[DEBUG] features shape: {features.shape}")
-                    print(f"[DEBUG] batch_size: {batch_size}, k_samples: {k_samples}")
-                    print(f"[DEBUG] features is_leaf: {features.is_leaf}")
-                    print(f"[DEBUG] features.grad_fn: {features.grad_fn}")
-                
-                # S'assurer que les features gardent les gradients
-                if not features.requires_grad:
-                    print(f"[WARNING] Features don't require grad! Enabling...")
-                    features = features.requires_grad_(True)
-                
+                if cfg.get('debug_contrastive', False) and train_steps < 2:
+                    if logger:
+                        logger.debug(f"activations: {activations}")
+                        logger.debug(f"activations.requires_grad: {activations.requires_grad}")
+                        logger.debug(f"activations shape: {activations.shape}")
+                        logger.debug(f"batch_size: {batch_size}, k_samples: {k_samples}")
+                        logger.debug(f"activations is_leaf: {activations.is_leaf}")
+                        logger.debug(f"activations.grad_fn: {activations.grad_fn}")
+
+                # S'assurer que les activations gardent les gradients
+                if not activations.requires_grad:
+                    print(f"[WARNING] Activations don't require grad! Enabling...")
+                    activations = activations.requires_grad_(True)
+
                 # Calculer la perte contrastive avec la nouvelle implémentation simple
                 # contrastive_loss = contrastive_loss_fn(features, batch_size, k_samples)
 
-                contrastive_loss, mean_pos_sim, mean_neg_sim = info_nce_loss(features, temperature = cfg.contrastive_temperature, logger = logger, 
+                contrastive_loss, mean_pos_sim, mean_neg_sim = info_nce_loss(activations, temperature = cfg.contrastive_temperature, logger = logger, 
                                                             sample_weights = None, use_divergent_only = cfg.use_divergent_only) 
                 # Debug: vérifier la perte contrastive
                 if cfg.get('debug_contrastive', False) and train_steps < 2:
-                    print(f"[DEBUG] contrastive_loss: {contrastive_loss.item():.6f}")
-                    print(f"[DEBUG] mean_pos_sim: {mean_pos_sim:.6f}, mean_neg_sim: {mean_neg_sim:.6f}")
-                    print(f"[DEBUG] contrastive_loss.requires_grad: {contrastive_loss.requires_grad}")
-                    print(f"[DEBUG] contrastive_loss.grad_fn: {contrastive_loss.grad_fn}")
-                      
+                    if logger:
+                        logger.debug(f"contrastive_loss: {contrastive_loss.item():.6f}")
+                        logger.debug(f"mean_pos_sim: {mean_pos_sim:.6f}, mean_neg_sim: {mean_neg_sim:.6f}")
+                        logger.debug(f"contrastive_loss.requires_grad: {contrastive_loss.requires_grad}")
+                        logger.debug(f"contrastive_loss.grad_fn: {contrastive_loss.grad_fn}")
+
             # ========== COMBINAISON DES PERTES ==========
             contrastive_weight = getattr(cfg, 'contrastive_weight', 0.1)
             total_loss = diffusion_loss + contrastive_weight * contrastive_loss
@@ -610,7 +674,11 @@ def main(cfg: DictConfig):
                         log_msg += f", Contrastive Loss: {contrastive_val:.4f}, Total Loss: {total_val:.4f}"
                         log_dict.update({
                             "train/contrastive_loss": contrastive_val,
-                            "train/total_loss": total_val
+                            "train/total_loss": total_val})
+                        if 'mean_pos_sim' in locals():
+                            log_dict.update({
+                            "train/mean_pos_sim": mean_pos_sim,
+                            "train/mean_neg_sim": mean_neg_sim 
                         })
                     log_msg += f", LR: {current_lr:.2e}"
                     logger.info(log_msg)
@@ -630,10 +698,15 @@ def main(cfg: DictConfig):
                         "model": model.module.state_dict(),
                         "ema": ema.state_dict(),
                         "opt": opt.state_dict(),
-                        "cfg": cfg,
+                        "train_steps": train_steps,
+                        "epoch": epoch,  # Optionnel si vous voulez sauvegarder l'epoch
+                        # "cfg": cfg,
                         "scaler": scaler.state_dict() if scaler is not None else None,
                         "scheduler": lr_scheduler.state_dict() if lr_scheduler else None # ✅ SAUVEGARDER LE SCHEDULER
                     }
+                    # Sauvegarder la config séparément si nécessaire
+                    config_dict = OmegaConf.to_container(cfg, resolve=True)  # Convertir en dict standard
+                    checkpoint["cfg"] = config_dict  # Dict standard compatible avec weights_only=True
                     checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
                     torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")

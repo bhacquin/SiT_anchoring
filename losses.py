@@ -1,6 +1,8 @@
 import torch.nn as nn
 import torch
 import torch.nn.functional as F
+import numpy as np
+from typing import Optional, Tuple, Union
 
 def info_nce_loss(vecs: torch.Tensor, temperature: float = 0.1, logger: Optional[object] = None, 
                   sample_weights: Optional[torch.Tensor] = None, use_divergent_only: bool = False, use_log_mean: bool = True) -> Tuple[torch.Tensor, float, float]:

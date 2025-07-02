@@ -1,6 +1,59 @@
 
 import os
 import sys
+import torch
+import numpy as np
+
+
+def compute_entropy(x: torch.Tensor, num_bins: int = 512) -> float:
+    """
+    Compute empirical entropy of tensor features.
+    
+    Args:
+        x: (N, d) tensor
+        num_bins: Number of bins for histogram
+        
+    Returns:
+        Mean entropy across all dimensions
+    """
+    x = x.detach().cpu().numpy()
+    
+    # Check for NaN or infinite values
+    if not np.isfinite(x).all():
+        print(f"Warning: Non-finite values detected in entropy computation. NaN count: {np.isnan(x).sum()}, Inf count: {np.isinf(x).sum()}")
+        # Replace NaN and infinite values with zeros
+        x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    entropies = []
+    
+    for i in range(x.shape[1]):
+        # Get finite values only for this dimension
+        col_data = x[:, i]
+        finite_mask = np.isfinite(col_data)
+        
+        if finite_mask.sum() == 0:
+            # If no finite values, entropy is 0
+            entropies.append(0.0)
+            continue
+            
+        finite_data = col_data[finite_mask]
+        
+        # Skip if all values are the same (entropy would be 0)
+        if len(np.unique(finite_data)) == 1:
+            entropies.append(0.0)
+            continue
+            
+        try:
+            hist, _ = np.histogram(finite_data, bins=num_bins, density=True)
+            hist = hist + 1e-8  # avoid log(0)
+            hist = hist / hist.sum()
+            ent = -np.sum(hist * np.log(hist))
+            entropies.append(ent)
+        except Exception as e:
+            print(f"Warning: Error computing histogram for dimension {i}: {e}")
+            entropies.append(0.0)
+        
+    return float(np.mean(entropies)) if entropies else 0.0
 
 
 def get_layer_by_name(model, layer_name):

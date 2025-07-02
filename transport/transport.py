@@ -133,8 +133,8 @@ class Transport:
         device = x1.device
         # Repeat x1 k times for k different samples
         if k > 1:
-            x1_expanded = x0.unsqueeze(1).expand(-1, k, -1, -1, -1)  # (B, k, C, H, W)
-            x_1_flat = x_t.reshape(-1, C, H, W)
+            x1_expanded = x1.unsqueeze(1).expand(-1, k, -1, -1, -1)  # (B, k, C, H, W)
+            x_1_flat = x1_expanded.reshape(-1, C, H, W)
             # x1_expanded = x1.repeat(k, 1, 1, 1)  # (batch_size * k, C, H, W)
             # Repeat model_kwargs if needed
             expanded_model_kwargs = {}

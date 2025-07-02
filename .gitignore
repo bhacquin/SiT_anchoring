@@ -1,6 +1,11 @@
 __pycache__
 wandb
 *.pt
+*.yaml
+*.out
+*.err
+*.sh
+
 .DS_store
 samples
 results
@@ -8,6 +13,3 @@ pretrained_models
 outputs/
 configs/
 config/
-*.yaml
-*.out
-*.err
