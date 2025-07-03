@@ -35,7 +35,7 @@ from download import find_model
 from transport import create_transport, Sampler
 from train_utils import init_wandb, get_layer_output_dim, create_scheduler, get_layer_by_name
 from diffusers.models import AutoencoderKL
-from losses import info_nce_loss
+from losses import info_nce_loss, dispersive_info_nce_loss
 import wandb_utils
 
 
@@ -261,7 +261,8 @@ def main(cfg: DictConfig):
     latent_size = cfg.image_size // 8
     model = SiT_models[cfg.model](
         input_size=latent_size,
-        num_classes=cfg.num_classes
+        num_classes=cfg.num_classes,
+        use_time=cfg.get('use_time', True)  # Use time embeddings if specified
     )
 
     # Note that parameter initialization is done within the SiT constructor
@@ -366,7 +367,7 @@ def main(cfg: DictConfig):
             logger.info(f"   - Activation dimension: {activation_feature_dim}")
             logger.info(f"   - Temperature: {getattr(cfg, 'contrastive_temperature', 0.5)}")
             logger.info(f"   - Num noisy versions: {getattr(cfg, 'contrastive_num_noisy_versions', 1)}")
-            logger.info(f"   - Include clean as positive: {getattr(cfg, 'contrastive_include_clean', True)}")
+            logger.info(f"   - Include clean as positive: {getattr(cfg, 'contrastive_include_clean', False)}")
             logger.info(f"   - Contrastive weight: {getattr(cfg, 'contrastive_weight', 0.1)}")
 
     # Load checkpoint states if resuming
@@ -560,15 +561,22 @@ def main(cfg: DictConfig):
             # print(f"[DEBUG] all_activations length: {len(all_activations)}, shape of first activation: {all_activations[0].shape}")
             # ========== PERTE CONTRASTIVE (si activée) ==========
             contrastive_loss = 0.0
-            if use_contrastive and k_samples > 1:
+            if use_contrastive:
                 # Utiliser directement les activations capturées
                 # all_activations[0] contient toutes les activations de forme (batch_size * k_samples, feature_dim)
                 features = layer_outputs[0]
                 B_times_k, number_of_patches, internal_dim = features.shape
                 layer_outputs.clear()
                 batch_size = x_clean.size(0)
-                activations = features.view(batch_size, k_samples, number_of_patches, internal_dim) 
 
+            if use_contrastive and cfg.use_divergent_only:
+                if logger and train_steps < 1:
+                    logger.info(f"Using divergent only contrastive loss with {k_samples} samples")
+                contrastive_loss = dispersive_info_nce_loss(features, temperature = cfg.contrastive_temperature,norm=cfg.use_norm_in_dispersive, logger = logger, use_l2=False)
+                if logger:
+                    logger.debug(f"divergent_loss: {contrastive_loss.item():.6f}")
+            elif use_contrastive and k_samples > 1:
+                activations = features.view(batch_size, k_samples, number_of_patches, internal_dim) 
                 # Vérification précoce des activations du modèle
                 if not torch.isfinite(activations).all():
                     if logger:
@@ -618,6 +626,11 @@ def main(cfg: DictConfig):
                         logger.debug(f"mean_pos_sim: {mean_pos_sim:.6f}, mean_neg_sim: {mean_neg_sim:.6f}")
                         logger.debug(f"contrastive_loss.requires_grad: {contrastive_loss.requires_grad}")
                         logger.debug(f"contrastive_loss.grad_fn: {contrastive_loss.grad_fn}")
+            else:
+                if logger:
+                    logger.debug("Skipping contrastive loss computation (not enabled or k_samples=1)")
+                    contrastive_loss = 0.0
+
 
             # ========== COMBINAISON DES PERTES ==========
             contrastive_weight = getattr(cfg, 'contrastive_weight', 0.1)
@@ -671,7 +684,10 @@ def main(cfg: DictConfig):
                     if isinstance(contrastive_loss, torch.Tensor):
                         contrastive_val = contrastive_loss.item()
                         total_val = total_loss.item()
-                        log_msg += f", Contrastive Loss: {contrastive_val:.4f}, Total Loss: {total_val:.4f}"
+                        if cfg.use_divergent_only:
+                            log_msg += f", Divergent Loss: {contrastive_val:.4f}, Total Loss: {total_val:.4f}"
+                        else:
+                            log_msg += f", Contrastive Loss: {contrastive_val:.4f}, Total Loss: {total_val:.4f}"
                         log_dict.update({
                             "train/contrastive_loss": contrastive_val,
                             "train/total_loss": total_val})

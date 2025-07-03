@@ -5,6 +5,7 @@ wandb
 *.out
 *.err
 *.sh
+core_nid*
 
 .DS_store
 samples
