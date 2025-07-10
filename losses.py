@@ -5,25 +5,6 @@ import numpy as np
 from typing import Optional, Tuple, Union
 
 
-# def dispersive_info_nce_loss(vecs: torch.Tensor,norm: Optional[bool] = False, temperature: float = 0.1, logger: Optional[object] = None, use_l2: bool = False) -> torch.Tensor:
-#     if vecs.ndim != 3:
-#         err_msg = f"L'entrée 'vecs' doit être 3D (B, P, D), mais a obtenu {vecs.ndim}D de forme {vecs.shape}."
-#         if logger: logger.error(err_msg)
-#         return torch.tensor(0.0, device=vecs.device, dtype=vecs.dtype), 0.0, 0.0
-#     vecs = vecs.reshape(vecs.shape[0], -1)
-#     if norm:
-#         vecs = F.normalize(vecs, dim=-1)  # Normaliser les vecteurs le long de la dernière dimension
-#     if use_l2:
-#         # Utiliser la distance euclidienne au lieu de la similarité cosinus
-#         # Calculer la matrice de distance euclidienne
-#         matrix_similarities = torch.cdist(vecs, vecs, p=2)
-#     else:
-#         matrix_similarities = vecs @ vecs.T / temperature # Aplatir pour obtenir une matrice de similarité
-#     mask = torch.eye(vecs.shape[0], dtype=torch.bool, device=vecs.device)
-#     matrix_similarities = matrix_similarities.masked_fill(mask, -float('inf'))
-#     all_log_sum_exp = torch.logsumexp(matrix_similarities, dim=0)
-#     return all_log_sum_exp.mean()
-
 def dispersive_info_nce_loss(vecs: torch.Tensor, norm: Optional[bool] = True, temperature: float = 0.1, 
                            logger: Optional[object] = None, use_l2: bool = False) -> torch.Tensor:
     """
@@ -67,36 +48,16 @@ def dispersive_info_nce_loss(vecs: torch.Tensor, norm: Optional[bool] = True, te
         # Distance L2 : plus c'est grand, plus c'est différent
         # On veut maximiser les distances, donc minimiser leur négatif
         distances = torch.cdist(vecs, vecs, p=2)  # (N, N)
+        squared_distances = distances ** 2  # (N, N)
+        similarities = -squared_distances
         
-        # Masquer la diagonale avec 0 (distance à soi-même)
-        # mask = torch.eye(N, dtype=torch.bool, device=vecs.device)
-        # distances = distances.masked_fill(mask, 0.0)
-        
-        # Pour disperser, on veut maximiser les distances, donc minimiser -distance
-        # On prend la moyenne des distances non-diagonales
-        # num_pairs = N * (N - 1)
-        # mean_distance = distances.mean()
-        
-        # Perte dispersive : minimiser le négatif de la distance moyenne
-        # (donc maximiser la distance moyenne)
-        # loss = -mean_distance / temperature
-        similarities = -distances
     else:
         # Similarité cosinus : plus c'est grand, plus c'est similaire
         # On veut minimiser les similarités
         similarities = torch.matmul(vecs, vecs.T)  # (N, N)
-        
-        # Masquer la diagonale avec une valeur neutre (0 pour similarity)
-        # num_valid_pairs = N * (N - 1)
     exp_similarities = torch.exp(similarities.view(-1) / temperature)
     mean_exp_similarities = exp_similarities.mean() 
-    loss = torch.log(mean_exp_similarities + 1e-8)
-        
-        # log_sum_exp = torch.logsumexp(similarities.view(-1), dim=0)
-        # log_count = torch.log(torch.tensor(num_valid_pairs, dtype=torch.float32, device=vecs.device))
-        # loss = log_sum_exp - log_count
-
-    
+    loss = torch.log(mean_exp_similarities + 1e-8)  
     return loss
 
 
@@ -152,7 +113,6 @@ def info_nce_loss(vecs: torch.Tensor, temperature: float = 0.1, logger: Optional
     
     # Normaliser les caractéristiques au niveau des vues aplaties
     z = F.normalize(vecs_flat, dim=-1)  # (B, V, P*D)
-    # z = vecs_flat   
     # Reshape vers (B*V, P*D) pour faciliter les calculs
     z_flat = z.reshape(B * V, P * D)  # (N, P*D) où N = B*V
     N = z_flat.shape[0]

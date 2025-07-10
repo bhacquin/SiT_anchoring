@@ -5,6 +5,10 @@
 A minimal training script for SiT using PyTorch DDP.
 """
 import torch
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -22,12 +26,13 @@ from copy import deepcopy
 from glob import glob
 from time import time
 import logging
-import os
-from datetime import timedelta
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
 from datasets import load_dataset
+import signal
+import os
+from datetime import datetime, timedelta
 
 from utils import get_config_info, get_layer_by_name, compute_entropy
 from models import SiT_models
@@ -42,6 +47,397 @@ import wandb_utils
 #################################################################################
 #                             Training Helper Functions                         #
 #################################################################################
+# def setup_timeout_signal_handler(checkpoint_dir, model, ema, opt, scaler, lr_scheduler, logger, cfg):
+#     """Configure un signal handler pour sauvegarder et relancer automatiquement"""
+    
+#     def timeout_handler(signum, frame):
+#         if logger:
+#             logger.warning("⏰ Timeout SLURM imminent, sauvegarde d'urgence et relance...")
+#         try:
+#             if cfg.get('wandb', False) and wandb.run is not None:
+#                 wandb.run.mark_preempting()
+#                 logger.info("📊 Wandb run marked as preempting")
+#                 # ✅ FINIR LE RUN PROPREMENT
+#                 wandb.finish(quiet=True)
+#                 if logger:
+#                     logger.info("📊 Wandb run finished properly")
+#         except Exception as e:
+#             if logger:
+#                 logger.warning(f"⚠️ Could not mark wandb preempting: {e}")
+        
+#         # ✅ SAUVEGARDER LE WANDB RUN ID
+#         wandb_run_id = None
+#         wandb_run_name = None
+#         if cfg.get('wandb', False) and wandb.run is not None:
+#             wandb_run_id = wandb.run.id
+#             wandb_run_name = wandb.run.name
+#             logger.info(f"📊 Sauvegarde wandb run_id: {wandb_run_id}")
+        
+#         # Récupérer la valeur actuelle de train_steps depuis les globals
+#         current_train_steps = globals().get('train_steps', 0)
+        
+#         # Sauvegarder immédiatement
+#         emergency_path = f"{checkpoint_dir}/emergency_checkpoint_{current_train_steps}.pt"
+#         config_dict = OmegaConf.to_container(cfg, resolve=True)  # Convertir en dict standard
+#         checkpoint = {
+#             "model": model.module.state_dict() if hasattr(model, 'module') else model.state_dict(),
+#             "ema": ema.state_dict(),
+#             "opt": opt.state_dict(),
+#             "scaler": scaler.state_dict() if scaler else None,
+#             "scheduler": lr_scheduler.state_dict() if lr_scheduler else None,
+#             "train_steps": current_train_steps,
+#             "timestamp": datetime.now().isoformat(),
+#             "cfg": config_dict,  # Ajouter la config complète
+#             "emergency_save": True,
+#         }
+        
+#         torch.save(checkpoint, emergency_path)
+#         if logger:
+#             logger.info(f"💾 Sauvegarde d'urgence: {emergency_path}")
+        
+#         # ✅ NOUVEAU: Créer une config modifiée et relancer
+#         relaunch_training(emergency_path, cfg, logger, wandb_run_id, wandb_run_name)
+    
+#     # Configurer les signaux
+#     signal.signal(signal.SIGTERM, timeout_handler)
+#     signal.signal(signal.SIGUSR1, timeout_handler)
+    
+#     if logger:
+#         logger.info("⏰ Signal handler configuré pour sauvegarde d'urgence et relance")
+
+# def relaunch_training(emergency_checkpoint_path, original_cfg, logger, wandb_run_id, wandb_run_name):
+#     """Relancer l'entraînement avec le checkpoint d'urgence"""
+    
+#     try:
+#         # Créer une copie de la config avec le nouveau checkpoint
+#         new_cfg = OmegaConf.structured(original_cfg)
+#         new_cfg.ckpt = emergency_checkpoint_path
+        
+#         # ✅ AJOUTER LES INFOS WANDB À LA CONFIG
+#         if wandb_run_id:
+#             new_cfg.wandb_resume_id = wandb_run_id
+#             new_cfg.wandb_resume_name = wandb_run_name
+#             if logger:
+#                 logger.info(f"📊 Config mise à jour avec wandb run_id: {wandb_run_id}")
+        
+#         # ✅ Créer un fichier YAML réel à côté du checkpoint
+#         checkpoint_dir = Path(emergency_checkpoint_path).parent
+#         config_filename = f"resume_config_{Path(emergency_checkpoint_path).stem}.yaml"
+#         config_path = checkpoint_dir / config_filename
+        
+#         # Sauvegarder la config modifiée
+#         with open(config_path, 'w') as f:
+#             OmegaConf.save(new_cfg, f)
+        
+#         if logger:
+#             logger.info(f"📝 Config de reprise sauvegardée: {config_path}")
+#             logger.info(f"🔄 Checkpoint configuré: {emergency_checkpoint_path}")
+#         print(f"📝 Config de reprise sauvegardée: {config_path}")
+#         print(f"🔄 Checkpoint configuré: {emergency_checkpoint_path}")
+#         # Déterminer le nombre de nœuds depuis l'environnement SLURM
+#         num_nodes = int(os.environ.get('SLURM_JOB_NUM_NODES', 1))
+#         gpus_per_node = int(os.environ.get('SLURM_GPUS_ON_NODE', 4))
+        
+#         if logger:
+#             logger.info(f"🖥️  Relance avec {num_nodes} nœuds, {gpus_per_node} GPUs par nœud")
+#         print(f"🖥️  Relance avec {num_nodes} nœuds, {gpus_per_node} GPUs par nœud")
+        
+#         # Construire la commande sbatch
+#         # Utiliser le script run_test.sh existant mais avec la nouvelle config
+#         cmd = [
+#             "sbatch",
+#             "--nodes", str(num_nodes),
+#             "--gpus-per-node", str(gpus_per_node),
+#             "--cpus-per-task", "32",  # Ajuster selon vos besoins
+#             "--ntasks-per-node", "4",  # Ajuster selon vos besoins
+#             "--time", "00:04:00",  # Durée maximale de 12 heures
+#             "--job-name", "sit_anchoring",
+#             "--partition", "normal",
+#             "--account", "a144",
+#             "--exclude", "nid005687,nid005911,nid005364,nid005247,nid005227,nid005236,nid005462,nid005340",
+#             "--output", "logs/training_cluster_%j_%x_.out",
+#             "--error", "logs/training_cluster_%j_%x.err",
+#             "run_test.sh",
+#             f"--config-file={config_path}"
+#         ]
+          
+#         if logger:
+#             logger.info(f"🚀 Commande de relance: {' '.join(cmd)}")
+#         print(f"🚀 Commande de relance: {' '.join(cmd)}")
+#         # Lancer la nouvelle soumission
+#         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        
+#         if result.returncode == 0:
+#             new_job_id = result.stdout.strip().split()[-1]  # Le job ID est généralement le dernier mot
+#             if logger:
+#                 logger.info(f"✅ Nouveau job soumis: {new_job_id}")
+#                 logger.info(f"📋 Config utilisée: {config_path}")
+#             print(f"✅ Nouveau job soumis: {new_job_id}")
+#             print(f"📋 Config utilisée: {config_path}")
+#         else:
+#             if logger:
+#                 logger.error(f"❌ Échec de la relance: {result.stderr}")
+        
+#     except Exception as e:
+#         if logger:
+#             logger.error(f"❌ Erreur lors de la relance: {e}")
+    
+#     finally:
+#         # Sortie propre
+#         os._exit(0)
+
+def setup_timeout_signal_handler(checkpoint_dir, model, ema, opt, scaler, lr_scheduler, logger, cfg):
+    """Configure un signal handler pour sauvegarder et relancer automatiquement"""
+    
+    def timeout_handler(signum, frame):
+        import sys
+        debug_file = f"{checkpoint_dir}/signal_debug.log"
+        
+        try:
+            with open(debug_file, 'w') as f:
+                f.write(f"Signal handler called: {signum}\n")
+                f.write(f"Time: {datetime.now().isoformat()}\n")
+                f.flush()
+            
+            sys.stderr.write(f"⏰ SIGNAL {signum} RECEIVED - Starting emergency save\n")
+            sys.stderr.flush()
+            
+        except Exception as e:
+            sys.stdout.write(f"Signal handler error: {e}\n")
+            sys.stdout.flush()
+        
+        # ✅ RÉCUPÉRER LES INFOS WANDB AVANT DE SAUVEGARDER
+        wandb_run_id = None
+        wandb_run_name = None
+        try:
+            with open(debug_file, 'a') as f:
+                f.write("Getting wandb info\n")
+                f.flush()
+            
+            if cfg.get('wandb', False):
+                import wandb
+                if wandb.run is not None:
+                    wandb_run_id = wandb.run.id
+                    wandb_run_name = wandb.run.name
+                    
+                    with open(debug_file, 'a') as f:
+                        f.write(f"✅ Wandb run found: {wandb_run_id} ({wandb_run_name})\n")
+                        f.flush()
+                    
+                    # Mark preempting et finir proprement
+                    try:
+                        wandb.run.mark_preempting()
+                        wandb.finish(quiet=True)
+                        
+                        with open(debug_file, 'a') as f:
+                            f.write("✅ Wandb finished successfully\n")
+                            f.flush()
+                    except:
+                        with open(debug_file, 'a') as f:
+                            f.write("⚠️ Wandb finish failed, continuing\n")
+                            f.flush()
+                else:
+                    with open(debug_file, 'a') as f:
+                        f.write("❌ No active wandb run found\n")
+                        f.flush()
+            
+        except Exception as e:
+            with open(debug_file, 'a') as f:
+                f.write(f"Wandb info retrieval failed: {e}\n")
+                f.flush()
+        
+        # ✅ SAUVEGARDER LE CHECKPOINT AVEC LES INFOS WANDB
+        try:
+            with open(debug_file, 'a') as f:
+                f.write("Starting checkpoint save\n")
+                f.flush()
+            
+            current_train_steps = globals().get('train_steps', 0)
+            emergency_path = f"{checkpoint_dir}/emergency_checkpoint_{current_train_steps}.pt"
+            
+            # ✅ INCLURE LES INFOS WANDB DANS LE CHECKPOINT
+            checkpoint = {
+                "model": model.module.state_dict() if hasattr(model, 'module') else model.state_dict(),
+                "ema": ema.state_dict(),
+                "opt": opt.state_dict(),
+                "scaler": scaler.state_dict() if scaler else None,
+                "scheduler": lr_scheduler.state_dict() if lr_scheduler else None,
+                "train_steps": current_train_steps,
+                "timestamp": datetime.now().isoformat(),
+                "emergency_save": True,
+                "wandb_run_id": wandb_run_id,  # ✅ AJOUTER ICI
+                "wandb_run_name": wandb_run_name  # ✅ AJOUTER ICI
+            }
+            
+            torch.save(checkpoint, emergency_path)
+            
+            with open(debug_file, 'a') as f:
+                f.write(f"✅ Checkpoint saved: {emergency_path}\n")
+                f.write(f"✅ Wandb info saved: {wandb_run_id}\n")
+                f.flush()
+            
+            sys.stderr.write(f"💾 Emergency checkpoint saved: {emergency_path}\n")
+            sys.stderr.flush()
+            
+        except Exception as e:
+            with open(debug_file, 'a') as f:
+                f.write(f"❌ Checkpoint save failed: {e}\n")
+                f.flush()
+            sys.stderr.write(f"❌ Checkpoint save failed: {e}\n")
+            sys.stderr.flush()
+        
+        # ✅ RELANCER AVEC LES BONNES INFOS
+        try:
+            with open(debug_file, 'a') as f:
+                f.write("Starting relaunch\n")
+                f.flush()
+            
+            relaunch_training_simple(emergency_path, cfg, wandb_run_id, wandb_run_name, debug_file)
+            
+        except Exception as e:
+            with open(debug_file, 'a') as f:
+                f.write(f"Relaunch failed: {e}\n")
+                f.flush()
+            sys.stderr.write(f"❌ Relaunch failed: {e}\n")
+            sys.stderr.flush()
+        
+        sys.stderr.write("🔄 Exiting process\n")
+        sys.stderr.flush()
+        os._exit(0)
+    
+    # Configurer les signaux
+    signal.signal(signal.SIGTERM, timeout_handler)
+    signal.signal(signal.SIGUSR1, timeout_handler)
+    
+    debug_file = f"{checkpoint_dir}/signal_debug.log"
+    try:
+        with open(debug_file, 'w') as f:
+            f.write(f"Signal handler setup at: {datetime.now().isoformat()}\n")
+            f.write(f"Checkpoint dir: {checkpoint_dir}\n")
+            f.flush()
+        print(f"✅ Signal handler configured, debug file: {debug_file}")
+    except Exception as e:
+        print(f"❌ Could not create debug file: {e}")
+
+def relaunch_training_simple(emergency_checkpoint_path, original_cfg, wandb_run_id, wandb_run_name, debug_file):
+    """Version simplifiée pour debug"""
+    
+    try:
+        with open(debug_file, 'a') as f:
+            f.write("Creating config file\n")
+            f.flush()
+        
+        # ✅ CHARGER LE CHECKPOINT POUR RÉCUPÉRER LES INFOS WANDB
+        checkpoint = torch.load(emergency_checkpoint_path, weights_only=False, map_location='cpu')
+        
+        # Utiliser les IDs passés en paramètre, sinon fallback sur ceux du checkpoint
+        if not wandb_run_id:
+            wandb_run_id = checkpoint.get('wandb_run_id', None)
+            wandb_run_name = checkpoint.get('wandb_run_name', None)
+        
+        with open(debug_file, 'a') as f:
+            f.write(f"Wandb run_id from params: {wandb_run_id}\n")
+            f.write(f"Wandb run_name from params: {wandb_run_name}\n")
+            f.flush()
+        
+        # Créer la config modifiée
+        from omegaconf import OmegaConf
+        # Convertir en dict puis recréer une DictConfig non-structurée
+        config_dict = OmegaConf.to_container(original_cfg, resolve=True)
+        new_cfg = OmegaConf.create(config_dict)
+        
+        # ✅ DÉSACTIVER LE MODE STRUCT POUR PERMETTRE L'AJOUT DE NOUVELLES CLÉS
+        OmegaConf.set_struct(new_cfg, False)
+        
+        # Maintenant on peut ajouter les nouvelles clés
+        new_cfg.ckpt = emergency_checkpoint_path
+        
+        # ✅ AJOUTER EXPLICITEMENT LES INFOS WANDB SI ELLES EXISTENT
+        if wandb_run_id:
+            new_cfg.wandb_resume_id = wandb_run_id
+            new_cfg.wandb_resume_name = wandb_run_name
+            
+            with open(debug_file, 'a') as f:
+                f.write(f"✅ Added wandb_resume_id to config: {wandb_run_id}\n")
+                f.write(f"✅ Added wandb_resume_name to config: {wandb_run_name}\n")
+                f.flush()
+        else:
+            with open(debug_file, 'a') as f:
+                f.write("❌ No wandb run_id found, will create new run\n")
+                f.flush()
+        
+        # Sauvegarder la config
+        checkpoint_dir = Path(emergency_checkpoint_path).parent
+        config_filename = f"resume_config_{Path(emergency_checkpoint_path).stem}.yaml"
+        config_path = checkpoint_dir / config_filename
+        
+        with open(config_path, 'w') as f:
+            OmegaConf.save(new_cfg, f)
+        
+        with open(debug_file, 'a') as f:
+            f.write(f"Config saved: {config_path}\n")
+            f.flush()
+        
+        # ✅ VÉRIFIER QUE LES CLÉS SONT BIEN DANS LE FICHIER
+        try:
+            # Relire le fichier pour vérifier
+            reloaded_cfg = OmegaConf.load(config_path)
+            if wandb_run_id:
+                with open(debug_file, 'a') as f:
+                    f.write(f"✅ Verification: wandb_resume_id in saved config = {getattr(reloaded_cfg, 'wandb_resume_id', 'NOT_FOUND')}\n")
+                    f.write(f"✅ Verification: wandb_resume_name in saved config = {getattr(reloaded_cfg, 'wandb_resume_name', 'NOT_FOUND')}\n")
+                    f.flush()
+        except Exception as verify_e:
+            with open(debug_file, 'a') as f:
+                f.write(f"❌ Verification failed: {verify_e}\n")
+                f.flush()
+        
+        # Paramètres SLURM
+        num_nodes = int(os.environ.get('SLURM_JOB_NUM_NODES', 1))
+        gpus_per_node = int(os.environ.get('SLURM_GPUS_ON_NODE', 4))
+        
+        with open(debug_file, 'a') as f:
+            f.write(f"SLURM params: {num_nodes} nodes, {gpus_per_node} gpus\n")
+            f.flush()
+        
+        # Commande sbatch
+        cmd = [
+            "sbatch",
+            "--nodes", str(num_nodes),
+            "--gpus-per-node", str(gpus_per_node),
+            "--cpus-per-task", "32",  # ✅ Réduit pour éviter CPU binding
+            "--ntasks-per-node", str(gpus_per_node),
+            "--time", "12:00:00",
+            "--job-name", "sit_anchoring_resume",
+            "--account", "a144",
+            "--exclude", "nid005687,nid005911,nid005364,nid005247,nid005227,nid005236,nid005462,nid005340",
+            "--output", "logs/training_cluster_%j_%x_.out",
+            "--error", "logs/training_cluster_%j_%x.err",
+            "run_test.sh",
+            f"--config-file={config_path}"
+        ]
+        
+        with open(debug_file, 'a') as f:
+            f.write(f"Command: {' '.join(cmd)}\n")
+            f.flush()
+        
+        # Lancer la commande
+        import subprocess
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        
+        with open(debug_file, 'a') as f:
+            f.write(f"Return code: {result.returncode}\n")
+            f.write(f"Stdout: {result.stdout}\n")
+            f.write(f"Stderr: {result.stderr}\n")
+            f.flush()
+        
+    except Exception as e:
+        with open(debug_file, 'a') as f:
+            f.write(f"Relaunch exception: {e}\n")
+            import traceback
+            f.write(traceback.format_exc())
+            f.flush()
+
 
 @torch.no_grad()
 def update_ema(ema_model, model, decay=0.9999):
@@ -151,20 +547,14 @@ def main(cfg: DictConfig):
     """
     Trains a new SiT model using Hydra configuration.
     """
-    # assert torch.cuda.is_available(), "Training currently requires at least one GPU."
-    # rank, local_rank, world_size, device = setup_distributed()
-    # # Setup DDP:
-    # dist.init_process_group("nccl")
-    # assert cfg.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
-    # assert rank == dist.get_rank()
-    # rank = dist.get_rank()
-    # device = rank % torch.cuda.device_count()
-    # seed = cfg.global_seed * dist.get_world_size() + rank
-    # torch.manual_seed(seed)
-    # torch.cuda.set_device(device)
-    # print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
-    # local_batch_size = int(cfg.global_batch_size // dist.get_world_size())
+    global train_steps
+    train_steps = 0
     # ========== INITIALISATION DDP CORRIGÉE ==========
+    if hasattr(cfg, 'wandb_resume_id'):
+        print(f"📊 Found wandb_resume_id: {cfg.wandb_resume_id}")
+        print(f"📊 Found wandb_resume_name: {cfg.wandb_resume_name}")
+    else:
+        print("📊 No wandb resume info found - will create new run")
     
     # Variables d'environnement SLURM
     rank = int(os.environ.get("RANK", int(os.environ.get("SLURM_PROCID", 0))))
@@ -254,7 +644,7 @@ def main(cfg: DictConfig):
         logger = create_logger(None)
 
     # Initialisation de wandb
-    init_wandb(cfg, rank, logger)
+    wandb_initialised = init_wandb(cfg, rank, logger)
 
     # Create model:
     assert cfg.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
@@ -264,7 +654,8 @@ def main(cfg: DictConfig):
         num_classes=cfg.num_classes,
         use_time=cfg.get('use_time', True)  # Use time embeddings if specified
     )
-
+    if logger:
+        logger.info(f"Using time as a condition: {cfg.get('use_time', True) }")
     # Note that parameter initialization is done within the SiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     model.to(device)
@@ -307,6 +698,18 @@ def main(cfg: DictConfig):
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=0)
     
+    if getattr(cfg, 'use_mlp_for_pairwise', False):
+        mlp = None
+        # Load checkpoint states if resuming
+        if cfg.ckpt is not None:
+            ckpt_path = cfg.ckpt
+            # Load optimizer state
+            if "mlp" in checkpoint:
+                mlp.load_state_dict(checkpoint["mlp"])
+                if rank == 0:
+                    logger.info("Loaded MLP state from checkpoint")
+    else:
+        mlp = None
 
     # Setup mixed precision
     mixed_precision = getattr(cfg, 'mixed_precision', 'fp32')
@@ -335,6 +738,7 @@ def main(cfg: DictConfig):
     layer_outputs = []
     hook_handle = None
     use_contrastive = getattr(cfg, 'use_contrastive_loss', False)   
+
     def hook_fn(module, input, output):
         layer_outputs.append(output)
     # print("[DEBUG] cfg.use_contrastive_loss", use_contrastive)
@@ -469,6 +873,18 @@ def main(cfg: DictConfig):
     else:
         train_steps = 0
 
+    # ✅ CALCULER L'EPOCH DE DÉPART
+    steps_per_epoch = len(loader)
+    start_epoch = train_steps // steps_per_epoch
+    remaining_steps_in_epoch = train_steps % steps_per_epoch
+
+    if rank == 0 and logger:
+        logger.info(f"📊 Dataset info:")
+        logger.info(f"   - Total samples: {len(dataset):,}")
+        logger.info(f"   - Steps per epoch: {steps_per_epoch}")
+        logger.info(f"   - Starting from epoch: {start_epoch}")
+        logger.info(f"   - Remaining steps in current epoch: {remaining_steps_in_epoch}")
+
     # Avancer le scheduler au bon endroit si on resume
     if cfg.ckpt is not None and train_steps > 0:
         if lr_scheduler and scheduler_update_mode == "step":
@@ -522,10 +938,26 @@ def main(cfg: DictConfig):
         model_fn = ema.forward
 
     logger.info(f"Training for {cfg.epochs} epochs...")
-    for epoch in range(cfg.epochs):
+    if rank == 0:
+        setup_timeout_signal_handler(
+            checkpoint_dir=checkpoint_dir,
+            model=model,
+            ema=ema,
+            opt=opt,
+            scaler=scaler,
+            lr_scheduler=lr_scheduler,
+            logger=logger,
+            cfg=cfg,
+        )
+    for epoch in range(start_epoch, cfg.epochs):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
-        for x, y in loader:
+        for batch_idx, (x, y) in enumerate(loader):
+            # ✅ SKIP LES BATCHES DÉJÀ TRAITÉS DANS L'EPOCH ACTUELLE
+            if epoch == start_epoch and batch_idx < remaining_steps_in_epoch:
+                if rank == 0 and batch_idx % 1000 == 0:  # Log progress occasionally
+                    logger.debug(f"Skipping batch {batch_idx}/{remaining_steps_in_epoch}")
+                continue
             x = x.to(device)
             y = y.to(device)
             
@@ -572,11 +1004,13 @@ def main(cfg: DictConfig):
             if use_contrastive and cfg.use_divergent_only:
                 if logger and train_steps < 1:
                     logger.info(f"Using divergent only contrastive loss with {k_samples} samples")
-                contrastive_loss = dispersive_info_nce_loss(features, temperature = cfg.contrastive_temperature,norm=cfg.use_norm_in_dispersive, logger = logger, use_l2=False)
+                contrastive_loss = dispersive_info_nce_loss(features, temperature = cfg.contrastive_temperature,norm=cfg.use_norm_in_dispersive, logger = logger, use_l2=cfg.use_l2_in_dispersive,)
                 if logger:
                     logger.debug(f"divergent_loss: {contrastive_loss.item():.6f}")
             elif use_contrastive and k_samples > 1:
                 activations = features.view(batch_size, k_samples, number_of_patches, internal_dim) 
+                if getattr(cfg, 'use_mlp_for_pairwise', False):
+                    activations = mlp(activations)  # Appliquer MLP si configuré B * K * N * dim
                 # Vérification précoce des activations du modèle
                 if not torch.isfinite(activations).all():
                     if logger:
@@ -596,7 +1030,7 @@ def main(cfg: DictConfig):
                     if logger and rank == 0:
                         logger.info(f"Entropy (activation): {entropy_mlp:.6f} at step {train_steps}")
                         log_dict = {"train/entropy_activation": entropy_mlp}
-                        if cfg.wandb:
+                        if cfg.wandb and wandb_initialised:
                             wandb_utils.log(log_dict, step=train_steps)
 
                 # Debug: vérifier les gradients avant la perte contrastive
@@ -699,7 +1133,7 @@ def main(cfg: DictConfig):
                     log_msg += f", LR: {current_lr:.2e}"
                     logger.info(log_msg)
                     
-                    if cfg.wandb:
+                    if cfg.wandb and wandb_initialised:
                         wandb_utils.log(log_dict, step=train_steps)
                 
                 # Reset monitoring variables:
@@ -723,7 +1157,7 @@ def main(cfg: DictConfig):
                     # Sauvegarder la config séparément si nécessaire
                     config_dict = OmegaConf.to_container(cfg, resolve=True)  # Convertir en dict standard
                     checkpoint["cfg"] = config_dict  # Dict standard compatible avec weights_only=True
-                    checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
+                    checkpoint_path = f"{checkpoint_dir}/{epoch}_{train_steps:07d}.pt"
                     torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
                 dist.barrier()
@@ -779,7 +1213,7 @@ def main(cfg: DictConfig):
                     # Prendre seulement les premières images pour logging (éviter duplications)
                     log_samples = out_samples[:num_sample_images]
                     
-                    if cfg.wandb:
+                    if cfg.wandb and wandb_initialised:
                         wandb_utils.log_image(log_samples, train_steps)
                     logger.info(f"Generated and logged {num_sample_images} EMA samples.")
 

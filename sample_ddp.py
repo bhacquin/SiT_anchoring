@@ -14,6 +14,7 @@ from models import SiT_models
 from download import find_model
 from transport import create_transport, Sampler
 from diffusers.models import AutoencoderKL
+from train import create_logger
 from train_utils import parse_ode_args, parse_sde_args, parse_transport_args
 from tqdm import tqdm
 import os
@@ -22,6 +23,11 @@ import numpy as np
 import math
 import argparse
 import sys
+import wandb_utils
+from datetime import timedelta
+import logging
+import wandb
+
 
 
 def create_npz_from_sample_folder(sample_dir, num=50_000):
@@ -45,19 +51,82 @@ def main(mode, args):
     """
     Run sampling.
     """
-    torch.backends.cuda.matmul.allow_tf32 = args.tf32  # True: fast but may lead to some small numerical differences
+    # Variables d'environnement SLURM
+    rank = int(os.environ.get("RANK", int(os.environ.get("SLURM_PROCID", 0))))
+    local_rank = int(os.environ.get("LOCAL_RANK", int(os.environ.get("SLURM_LOCALID", 0))))
+    world_size = int(os.environ.get("WORLD_SIZE", int(os.environ.get("SLURM_NTASKS", 1))))
+    
+    print(f"🔧 [Process {rank}] Initialisation - Local rank: {local_rank}, World size: {world_size}")
+    
+    # CRITIQUE: Vérifier et configurer le device AVANT l'init DDP
+    device_count = torch.cuda.device_count()
+    print(f"🔧 [Process {rank}] Devices disponibles: {device_count}")
+    
+    if local_rank >= device_count:
+        raise RuntimeError(f"Local rank {local_rank} >= device count {device_count}")
+    
+    # Configurer le device AVANT toute autre opération CUDA
     assert torch.cuda.is_available(), "Sampling with DDP requires at least one GPU. sample.py supports CPU-only usage"
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
+    
+    print(f"🔧 [Process {rank}] Device configuré: {device}")
+    
+    # Test device
+    try:
+        test_tensor = torch.randn(10, device=device)
+        print(f"✅ [Process {rank}] Device test réussi: {test_tensor.device}")
+    except Exception as e:
+        print(f"❌ [Process {rank}] Device test échoué: {e}")
+        raise
+
+    torch.backends.cuda.matmul.allow_tf32 = args.tf32  # True: fast but may lead to some small numerical differences
     torch.set_grad_enabled(False)
 
     # Setup DDP:
-    dist.init_process_group("nccl")
-    rank = dist.get_rank()
-    device = rank % torch.cuda.device_count()
+    # dist.init_process_group("nccl")
+    # Initialiser le process group seulement si nécessaire
+    if world_size > 1:
+        if not dist.is_initialized():
+            master_addr = os.environ.get("MASTER_ADDR", "localhost")
+            master_port = os.environ.get("MASTER_PORT", "12355")
+            
+            print(f"🔧 [Process {rank}] Init process group: {master_addr}:{master_port}")
+            
+            dist.init_process_group(
+                backend="nccl",
+                init_method=f"tcp://{master_addr}:{master_port}",
+                world_size=world_size,
+                rank=rank,
+                timeout=timedelta(seconds=7200)  # 2h timeout
+            )
+            
+            print(f"✅ [Process {rank}] Process group initialisé")
+
     seed = args.global_seed * dist.get_world_size() + rank
     torch.manual_seed(seed)
     torch.cuda.set_device(device)
-    print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
+    print(f"🌱 Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
+    if rank == 0:
+        logger = create_logger("/capstor/scratch/cscs/vbastien/SiT_anchoring", level=logging.INFO)
+    else:
+        logger = create_logger(None)
 
+    if args.ckpt is not None:
+        ckpt_path = args.ckpt
+        try:
+            checkpoint = torch.load(ckpt_path, weights_only=True, map_location='cpu')
+            if rank == 0:
+                if logger:
+                    logger.info("✅ Checkpoint loaded with weights_only=True")
+        except Exception as e:
+            if rank == 0 and logger:
+                logger.warning(f"⚠️ Failed to load with weights_only=True: {str(e)}")
+                logger.warning("Falling back to weights_only=False. Ensure checkpoint is trusted.")
+            checkpoint = torch.load(ckpt_path, weights_only=False, map_location='cpu')
+        
+        cfg = checkpoint["cfg"]  # Load the config from the checkpoint
+    
     if args.ckpt is None:
         assert args.model == "SiT-XL/2", "Only SiT-XL/2 models are available for auto-download."
         assert args.image_size in [256, 512]
@@ -66,20 +135,41 @@ def main(mode, args):
         learn_sigma = args.image_size == 256
     else:
         learn_sigma = False
-
-    # Load model:
+    print("Time", cfg.get('use_time', True), "contrastive", getattr(cfg, 'use_contrastive', False), "batch_size", getattr(cfg, 'global_batch_size', 256))
     latent_size = args.image_size // 8
     model = SiT_models[args.model](
         input_size=latent_size,
-        num_classes=args.num_classes,
-        learn_sigma=learn_sigma,
-    ).to(device)
-    # Auto-download a pre-trained model or load a custom SiT checkpoint from train.py:
-    ckpt_path = args.ckpt or f"SiT-XL-2-{args.image_size}x{args.image_size}.pt"
-    state_dict = find_model(ckpt_path)
-    model.load_state_dict(state_dict)
+        num_classes=getattr(cfg, 'num_classes', args.num_classes),
+        use_time=cfg.get('use_time', True)  # Use time embeddings if specified
+    )
+    model = model.to(device)
+    model.load_state_dict(checkpoint["ema"])
+    model.eval()  # Important to set the model to evaluation mode
+    """
+    Initialisation de wandb (seulement sur le processus principal)
+    """
+    if rank == 0:
+        try:
+            if cfg['wandb_api_key'] is not None:
+                os.environ["WANDB_API_KEY"] = cfg['wandb_api_key']
+            else:
+                print(f"⚠️ No Wandb api key.")
+                os.environ["WANDB_API_KEY"] = '7054f94a0dfd9c1584b29282bae968073f5139f7'
+
+            project_name = "Sampling SiT" 
+            run_name = getattr(cfg, 'wandb_run_name', getattr(cfg, 'run_name', 'ddp-native-test'))
+            
+            wandb.init(project=project_name, name=run_name, config=dict(cfg))
+            if logger:
+                logger.info(f"✅ Wandb initialisé - Projet: {project_name}, Run: {run_name}")
+            print(f"✅ Wandb initialisé - Projet: {project_name}, Run: {run_name}")
+        except Exception as e:
+            if logger:
+                logger.warning(f"⚠️ Erreur lors de l'initialisation de Wandb: {e}")
+            print(f"⚠️ Erreur lors de l'initialisation de Wandb: {e}")
+            print("🔄 Continuer sans Wandb")
+    # requires_grad(model, False)
     model.eval()  # important!
-    
     
     transport = create_transport(
         args.path_type,
@@ -157,10 +247,13 @@ def main(mode, args):
     for i in pbar:
         # Sample inputs:
         z = torch.randn(n, model.in_channels, latent_size, latent_size, device=device)
-        y = torch.randint(0, args.num_classes, (n,), device=device)
+        if args.unsupervised:
+            y = torch.tensor([1000] * n, device=device)
+        else:
+            y = torch.randint(0, args.num_classes, (n,), device=device)
         
         # Setup classifier-free guidance:
-        if using_cfg:
+        if using_cfg and not args.unsupervised:
             z = torch.cat([z, z], 0)
             y_null = torch.tensor([1000] * n, device=device)
             y = torch.cat([y, y_null], 0)
@@ -175,6 +268,10 @@ def main(mode, args):
             samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
 
         samples = vae.decode(samples / 0.18215).sample
+
+        if rank==0 and i <= 2:
+            wandb_utils.log_image(samples)
+
         samples = torch.clamp(127.5 * samples + 128.0, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
 
         # Save samples to disk as individual .png files
@@ -196,7 +293,6 @@ def main(mode, args):
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
-
     if len(sys.argv) < 2:
         print("Usage: program.py <mode> [options]")
         sys.exit(1)
@@ -208,17 +304,18 @@ if __name__ == "__main__":
 
     parser.add_argument("--model", type=str, choices=list(SiT_models.keys()), default="SiT-XL/2")
     parser.add_argument("--vae",  type=str, choices=["ema", "mse"], default="ema")
-    parser.add_argument("--sample-dir", type=str, default="samples")
-    parser.add_argument("--per-proc-batch-size", type=int, default=4)
+    parser.add_argument("--sample-dir", type=str, default="samples_supervised_notimecond")
+    parser.add_argument("--per-proc-batch-size", type=int, default=64)
     parser.add_argument("--num-fid-samples", type=int, default=50_000)
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
+    parser.add_argument("--unsupervised", action='store_true')
     parser.add_argument("--cfg-scale",  type=float, default=1.0)
     parser.add_argument("--num-sampling-steps", type=int, default=250)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--tf32", action=argparse.BooleanOptionalAction, default=True,
                         help="By default, use TF32 matmuls. This massively accelerates sampling on Ampere GPUs.")
-    parser.add_argument("--ckpt", type=str, default=None,
+    parser.add_argument("--ckpt", type=str, default="/capstor/scratch/cscs/vbastien/SiT_anchoring/outputs/2025-07-08/14-31-07/checkpoints/0300000.pt",
                         help="Optional path to a SiT checkpoint (default: auto-download a pre-trained SiT-XL/2 model).")
 
     parse_transport_args(parser)

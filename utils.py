@@ -113,7 +113,7 @@ def get_config_info():
     
     # 3. Configuration par défaut
     print("📋 Using default config from current directory")
-    return ".", "config"
+    return "config", "config"
 
 # Debug pour voir ce qui se passe
 print(f"🔍 Current working directory: {os.getcwd()}")

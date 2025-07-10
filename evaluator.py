@@ -26,8 +26,8 @@ FID_SPATIAL_NAME = "mixed_6/conv:0"
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("ref_batch", help="path to reference batch npz file", default="ref_batch.npz")
-    parser.add_argument("sample_batch", help="path to sample batch npz file")
+    parser.add_argument("--ref_batch", help="path to reference batch npz file", default="/capstor/scratch/cscs/vbastien/SiT_anchoring/VIRTUAL_imagenet256_labeled.npz")
+    parser.add_argument("--sample_batch", help="path to sample batch npz file", default="/capstor/scratch/cscs/vbastien/SiT_anchoring/samples_supervised_notimecond/SiT-XL-2-0300000-cfg-1.0-64-ODE-250-dopri5.npz")
     args = parser.parse_args()
 
     config = tf.ConfigProto(
@@ -240,8 +240,8 @@ class ManifoldEstimator:
 
     def warmup(self):
         feats, radii = (
-            np.zeros([1, 2048], dtype=np.float32),
-            np.zeros([1, 1], dtype=np.float32),
+            np.zeros([1, 2048], dtype=float),
+            np.zeros([1, 1], dtype=float),
         )
         self.evaluate_pr(feats, radii, feats, radii)
 
@@ -249,9 +249,9 @@ class ManifoldEstimator:
         num_images = len(features)
 
         # Estimate manifold of features by calculating distances to k-NN of each sample.
-        radii = np.zeros([num_images, self.num_nhoods], dtype=np.float32)
-        distance_batch = np.zeros([self.row_batch_size, num_images], dtype=np.float32)
-        seq = np.arange(max(self.nhood_sizes) + 1, dtype=np.int32)
+        radii = np.zeros([num_images, self.num_nhoods], dtype=float)
+        distance_batch = np.zeros([self.row_batch_size, num_images], dtype=float)
+        seq = np.arange(max(self.nhood_sizes) + 1, dtype=int)
 
         for begin1 in range(0, num_images, self.row_batch_size):
             end1 = min(begin1 + self.row_batch_size, num_images)
@@ -286,10 +286,10 @@ class ManifoldEstimator:
         """
         num_eval_images = eval_features.shape[0]
         num_ref_images = radii.shape[0]
-        distance_batch = np.zeros([self.row_batch_size, num_ref_images], dtype=np.float32)
-        batch_predictions = np.zeros([num_eval_images, self.num_nhoods], dtype=np.int32)
-        max_realism_score = np.zeros([num_eval_images], dtype=np.float32)
-        nearest_indices = np.zeros([num_eval_images], dtype=np.int32)
+        distance_batch = np.zeros([self.row_batch_size, num_ref_images], dtype=float)
+        batch_predictions = np.zeros([num_eval_images, self.num_nhoods], dtype=int)
+        max_realism_score = np.zeros([num_eval_images], dtype=float)
+        nearest_indices = np.zeros([num_eval_images], dtype=int)
 
         for begin1 in range(0, num_eval_images, self.row_batch_size):
             end1 = min(begin1 + self.row_batch_size, num_eval_images)
@@ -340,8 +340,8 @@ class ManifoldEstimator:
                  - precision: an np.ndarray of length K1
                  - recall: an np.ndarray of length K2
         """
-        features_1_status = np.zeros([len(features_1), radii_2.shape[1]], dtype=np.bool)
-        features_2_status = np.zeros([len(features_2), radii_1.shape[1]], dtype=np.bool)
+        features_1_status = np.zeros([len(features_1), radii_2.shape[1]], dtype=bool)
+        features_2_status = np.zeros([len(features_2), radii_1.shape[1]], dtype=bool)
         for begin_1 in range(0, len(features_1), self.row_batch_size):
             end_1 = begin_1 + self.row_batch_size
             batch_1 = features_1[begin_1:end_1]

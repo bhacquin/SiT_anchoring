@@ -4,6 +4,8 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from copy import deepcopy
 from torchvision.transforms import CenterCrop
+from omegaconf import DictConfig, OmegaConf
+
 
 def create_scheduler(optimizer, cfg, total_steps):
     """
@@ -212,28 +214,188 @@ def parse_sde_args(parser):
     group.add_argument("--last-step-size", type=float, default=0.04, \
                         help="size of the last step taken")
 
+
 def init_wandb(cfg, rank, logger = None):
     """
     Initialisation de wandb (seulement sur le processus principal)
+    Essaie d'abord online, puis fallback vers offline
     """
-    use_wandb = getattr(cfg, 'wandb', False)
-    if rank == 0 and use_wandb:
+    if not cfg.get('wandb', False) or rank != 0:
+        return False
+    
+    try:
+        import wandb
+        
+        # ✅ Vérifier s'il faut reprendre un run existant
+        resume_id = getattr(cfg, 'wandb_resume_id', None)
+        resume_name = getattr(cfg, 'wandb_resume_name', None)
+
+        if hasattr(cfg, "wandb_api_key") and cfg.wandb_api_key and cfg.wandb_api_key != "<TON_API_KEY_WANDB>":
+            os.environ["WANDB_API_KEY"] = cfg.wandb_api_key
+        else:
+            print(f"⚠️ No Wandb API key found during initialization.")
+        
+        project_name = getattr(cfg, 'wandb_project', getattr(cfg, 'project_name', 'sit-anchoring'))
+        run_name = getattr(cfg, 'wandb_run_name', getattr(cfg, 'run_name', 'sit_training'))
+        
+        # ✅ CONFIGURATION DE BASE
+        base_config = {
+            'project': project_name,
+            'config': OmegaConf.to_container(cfg, resolve=True),
+        }
+        
+        # ✅ GESTION DE LA REPRISE
+        if resume_id:
+            base_config.update({
+                'id': resume_id,
+                'name': resume_name,
+                'resume': 'must',
+                'reinit': True
+            })
+            if logger:
+                logger.info(f"📊 Reprise du run wandb existant: {resume_id} ({resume_name})")
+            print(f"📊 Reprise du run wandb existant: {resume_id} ({resume_name})")
+        else:
+            base_config.update({
+                'name': run_name,
+                'resume': 'never'
+            })
+            if logger:
+                logger.info(f"📊 Création d'un nouveau run wandb: {run_name}")
+            print(f"📊 Création d'un nouveau run wandb: {run_name}")
+        
+        # ✅ ESSAYER D'ABORD LE MODE ONLINE
         try:
-            if hasattr(cfg, "wandb_api_key") and cfg.wandb_api_key and cfg.wandb_api_key != "<TON_API_KEY_WANDB>":
-                os.environ["WANDB_API_KEY"] = cfg.wandb_api_key
-            
-            project_name = getattr(cfg, 'wandb_project', getattr(cfg, 'project_name', 'dit-diffusion-anchoring'))
-            run_name = getattr(cfg, 'wandb_run_name', getattr(cfg, 'run_name', 'ddp-native-test'))
-            
-            wandb.init(project=project_name, name=run_name, config=dict(cfg))
             if logger:
-                logger.info(f"✅ Wandb initialisé - Projet: {project_name}, Run: {run_name}")
-            print(f"✅ Wandb initialisé - Projet: {project_name}, Run: {run_name}")
-        except Exception as e:
+                logger.info("🌐 Tentative d'initialisation wandb en mode ONLINE...")
+            print("🌐 Tentative d'initialisation wandb en mode ONLINE...")
+            
+            online_config = base_config.copy()
+            online_config.update({
+                'mode': 'online',
+                'settings': wandb.Settings(
+                    start_method='thread',
+                    init_timeout=30,  # ✅ Timeout plus court pour online
+                )
+            })
+            
+            run = wandb.init(**online_config)
+            
             if logger:
-                logger.warning(f"⚠️ Erreur lors de l'initialisation de Wandb: {e}")
-            print(f"⚠️ Erreur lors de l'initialisation de Wandb: {e}")
-            print("🔄 Continuer sans Wandb")
+                logger.info(f"✅ Wandb ONLINE initialisé - Projet: {project_name}, Run: {run.name}")
+            print(f"✅ Wandb ONLINE initialisé - Projet: {project_name}, Run: {run.name}")
+            return True
+            
+        except Exception as online_error:
+            if logger:
+                logger.warning(f"⚠️ Mode ONLINE échoué: {online_error}")
+            print(f"⚠️ Mode ONLINE échoué: {online_error}")
+            
+            # ✅ NETTOYER AVANT LE FALLBACK
+            try:
+                wandb.finish()
+            except:
+                pass
+            
+            # ✅ FALLBACK VERS MODE OFFLINE
+            if logger:
+                logger.info("🔄 Fallback vers mode OFFLINE...")
+            print("🔄 Fallback vers mode OFFLINE...")
+            
+            # ✅ CONFIGURATION OFFLINE
+            offline_config = base_config.copy()
+            offline_config.update({
+                'mode': 'offline',
+                'settings': wandb.Settings(
+                    start_method='thread',
+                    init_timeout=60,
+                )
+            })
+            
+            # ✅ VARIABLES D'ENVIRONNEMENT POUR OFFLINE
+            os.environ["WANDB_MODE"] = "offline"
+            os.environ["WANDB_DISABLE_SERVICE"] = "true"
+            
+            run = wandb.init(**offline_config)
+            
+            if logger:
+                logger.info(f"✅ Wandb OFFLINE initialisé - Projet: {project_name}, Run: {run.name}")
+                logger.info(f"📁 Les logs seront sauvés localement dans: {run.dir}")
+            print(f"✅ Wandb OFFLINE initialisé - Projet: {project_name}, Run: {run.name}")
+            print(f"📁 Les logs seront sauvés localement dans: {run.dir}")
+            
+            return True
+        
+    except Exception as e:
+        if logger:
+            logger.warning(f"⚠️ Erreur lors de l'initialisation de Wandb (online et offline): {e}")
+        print(f"⚠️ Erreur lors de l'initialisation de Wandb (online et offline): {e}")
+        print("🔄 Continuer sans Wandb")
+        return False
+
+
+# def init_wandb(cfg, rank, logger = None):
+#     """
+#     Initialisation de wandb (seulement sur le processus principal)
+#     """
+#     use_wandb = getattr(cfg, 'wandb', False)
+#     if not cfg.get('wandb', False) or rank != 0:
+#         return False
+    
+#     try:
+#         # ✅ Vérifier s'il faut reprendre un run existant
+#         resume_id = getattr(cfg, 'wandb_resume_id', None)
+#         resume_name = getattr(cfg, 'wandb_resume_name', None)
+
+#         if hasattr(cfg, "wandb_api_key") and cfg.wandb_api_key and cfg.wandb_api_key != "<TON_API_KEY_WANDB>":
+#             os.environ["WANDB_API_KEY"] = cfg.wandb_api_key
+#         else:
+#             print(f"⚠️ No Wandb API key found during initialization.")
+#         project_name = getattr(cfg, 'wandb_project', getattr(cfg, 'project_name', 'sit-anchoring'))
+#         run_name = getattr(cfg, 'wandb_run_name', getattr(cfg, 'run_name', 'sit_training'))
+        
+#         wandb_config = {
+#             'project': project_name,
+#             'config': OmegaConf.to_container(cfg, resolve=True),
+#             'settings': wandb.Settings(
+#                 start_method='thread',
+#                 init_timeout=120,
+#             )
+#         }
+#         # ✅ GESTION DE LA REPRISE
+#         if resume_id:
+#             # Reprendre un run existant
+#             wandb_config.update({
+#                 'id': resume_id,
+#                 'name': resume_name,
+#                 'resume': 'must',  # Forcer la reprise
+#                 'reinit': True
+#             })
+#             if logger:
+#                 logger.info(f"📊 Reprise du run wandb existant: {resume_id} ({resume_name})")
+#         else:
+#             # Nouveau run
+#             wandb_config.update({
+#                 'name': run_name,
+#                 'resume': 'never'
+#             })
+#             if logger:
+#                 logger.info(f"📊 Création d'un nouveau run wandb: {run_name}")
+        
+
+#         run = wandb.init(**wandb_config)
+#         # wandb.init(project=project_name, name=run_name, config=dict(cfg))
+#         if logger:
+#             logger.info(f"✅ Wandb initialisé - Projet: {project_name}, Run: {run_name}")
+#         print(f"✅ Wandb initialisé - Projet: {project_name}, Run: {run_name}")
+#         return True
+#     except Exception as e:
+#         if logger:
+#             logger.warning(f"⚠️ Erreur lors de l'initialisation de Wandb: {e}")
+#         print(f"⚠️ Erreur lors de l'initialisation de Wandb: {e}")
+#         print("🔄 Continuer sans Wandb")
+#         return 0
+
 
 def get_layer_by_name(model, layer_name):
     """

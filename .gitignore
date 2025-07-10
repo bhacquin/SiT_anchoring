@@ -5,6 +5,9 @@ wandb
 *.out
 *.err
 *.sh
+*.png
+*.npz
+
 core_nid*
 
 .DS_store
@@ -14,3 +17,4 @@ pretrained_models
 outputs/
 configs/
 config/
+samples*

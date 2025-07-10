@@ -1,0 +1,4 @@
+[[34m2025-07-08 21:39:33[0m] ✅ Checkpoint loaded with weights_only=True
+[[34m2025-07-08 21:39:39[0m] ✅ Wandb initialisé - Projet: Sampling SiT, Run: ddp-native-test
+[[34m2025-07-08 22:50:39[0m] ✅ Checkpoint loaded with weights_only=True
+[[34m2025-07-08 22:50:47[0m] ✅ Wandb initialisé - Projet: Sampling SiT, Run: ddp-native-test
