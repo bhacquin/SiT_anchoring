@@ -16,6 +16,14 @@ from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
+def build_mlp(hidden_size, projector_dim, z_dim):
+    return nn.Sequential(
+                nn.Linear(hidden_size, projector_dim),
+                nn.SiLU(),
+                nn.Linear(projector_dim, projector_dim),
+                nn.SiLU(),
+                nn.Linear(projector_dim, z_dim),
+            )
 
 #################################################################################
 #               Embedding Layers for Timesteps and Class Labels                 #
@@ -149,12 +157,16 @@ class SiT(nn.Module):
         patch_size=2,
         in_channels=4,
         hidden_size=1152,
+        encoder_depth=[],
         depth=28,
         num_heads=16,
         mlp_ratio=4.0,
         class_dropout_prob=0.1,
         num_classes=1000,
         learn_sigma=True,
+        projection_dim=2048,
+        use_projectors=[],
+        z_dims=[],
         use_time=True, 
     ):
         super().__init__()
@@ -164,7 +176,15 @@ class SiT(nn.Module):
         self.patch_size = patch_size
         self.num_heads = num_heads
         self.use_time = use_time
+        self.z_dims = z_dims
+        self.encoder_depth = encoder_depth
+        self.use_projectors = use_projectors
 
+        # ✅ Validate that lists have the same length
+        if len(encoder_depth) != len(use_projectors):
+            raise ValueError(f"encoder_depth ({len(encoder_depth)}) and use_projectors ({len(use_projectors)}) must have the same length")
+        # ✅ Create a mapping from encoder depth to projector index
+        self.depth_to_projector = {depth: idx for idx, depth in enumerate(self.encoder_depth)}
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         if self.use_time:
             self.t_embedder = TimestepEmbedder(hidden_size)
@@ -178,6 +198,14 @@ class SiT(nn.Module):
         self.blocks = nn.ModuleList([
             SiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
         ])
+        # ✅ Create projectors only where use_projectors[i] is True
+        self.projectors = nn.ModuleList()
+        for i, should_use_projector in enumerate(use_projectors):
+            if should_use_projector:
+                self.projectors.append(build_mlp(hidden_size, projection_dim, z_dims[i]))
+            else:
+                self.projectors.append(None)  # Placeholder for consistency
+        
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
         self.initialize_weights()
 
@@ -248,13 +276,35 @@ class SiT(nn.Module):
             c = t + y
         else:
             c = y                              # (N, D)
-        for block in self.blocks:
-            x = block(x, c)                      # (N, T, D)
+        zs = []  # List to store projected representations at each encoder depth
+        
+        for i, block in enumerate(self.blocks):
+            x = block(x, c) # (N, T, D)
+            # ✅ Check if we should collect activations at this depth
+            current_depth = i
+            if current_depth in self.depth_to_projector:
+                projector_idx = self.depth_to_projector[current_depth]      
+                # ✅ Check if we should use a projector for this specific depth
+                if self.use_projectors[projector_idx]:
+                    # Use projector MLP
+                    projector = self.projectors[projector_idx]
+                    if projector is not None:  # Extra safety check
+                        # Get dimensions
+                        N, T, D = x.shape
+                        # Project and reshape
+                        z = projector(x.reshape(-1, D)).reshape(N, T, -1)
+                        zs.append(z)
+                    else:
+                        # Fallback to raw activations if projector is None
+                        zs.append(x.clone())
+                else:
+                    # Return raw activations without projection
+                    zs.append(x.clone())
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         if self.learn_sigma:
             x, _ = x.chunk(2, dim=1)
-        return x
+        return x, zs
 
     def forward_with_cfg(self, x, t, y, cfg_scale):
         """
@@ -263,16 +313,12 @@ class SiT(nn.Module):
         # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
         half = x[: len(x) // 2]
         combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, y)
-        # For exact reproducibility reasons, we apply classifier-free guidance on only
-        # three channels by default. The standard approach to cfg applies it to all channels.
-        # This can be done by uncommenting the following line and commenting-out the line following that.
-        # eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
+        model_out, zs = self.forward(combined, t, y)
         eps, rest = model_out[:, :3], model_out[:, 3:]
         cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
         half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
         eps = torch.cat([half_eps, half_eps], dim=0)
-        return torch.cat([eps, rest], dim=1)
+        return torch.cat([eps, rest], dim=1), zs
 
 
 #################################################################################

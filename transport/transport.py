@@ -131,12 +131,9 @@ class Transport:
             model_kwargs = {}
         B, C, H, W = x1.shape
         device = x1.device
-        # Repeat x1 k times for k different samples
         if k > 1:
             x1_expanded = x1.unsqueeze(1).expand(-1, k, -1, -1, -1)  # (B, k, C, H, W)
             x_1_flat = x1_expanded.reshape(-1, C, H, W)
-            # x1_expanded = x1.repeat(k, 1, 1, 1)  # (batch_size * k, C, H, W)
-            # Repeat model_kwargs if needed
             expanded_model_kwargs = {}
             for key, value in model_kwargs.items():
                 if hasattr(value, 'repeat'):
@@ -150,12 +147,13 @@ class Transport:
         # Standard diffusion sampling
         t, x0, x1_current = self.sample(x_1_flat)
         t, xt, ut = self.path_sampler.plan(t, x0, x1_current)
-        model_output = model(xt, t, **expanded_model_kwargs)
+        model_output, zs = model(xt, t, **expanded_model_kwargs)
         B, *_, C = xt.shape
         assert model_output.size() == (B, *xt.size()[1:-1], C)
 
         terms = {}
         terms['pred'] = model_output
+        terms['activations'] = zs if zs is not None else []
         if self.model_type == ModelType.VELOCITY:
             loss = mean_flat(((model_output - ut) ** 2))
         else: 
@@ -189,18 +187,18 @@ class Transport:
         """member function for obtaining the drift of the probability flow ODE"""
         def score_ode(x, t, model, **model_kwargs):
             drift_mean, drift_var = self.path_sampler.compute_drift(x, t)
-            model_output = model(x, t, **model_kwargs)
+            model_output, _ = model(x, t, **model_kwargs)
             return (-drift_mean + drift_var * model_output) # by change of variable
         
         def noise_ode(x, t, model, **model_kwargs):
             drift_mean, drift_var = self.path_sampler.compute_drift(x, t)
             sigma_t, _ = self.path_sampler.compute_sigma_t(path.expand_t_like_x(t, x))
-            model_output = model(x, t, **model_kwargs)
+            model_output, _ = model(x, t, **model_kwargs)
             score = model_output / -sigma_t
             return (-drift_mean + drift_var * score)
         
         def velocity_ode(x, t, model, **model_kwargs):
-            model_output = model(x, t, **model_kwargs)
+            model_output, _ = model(x, t, **model_kwargs)
             return model_output
 
         if self.model_type == ModelType.NOISE:

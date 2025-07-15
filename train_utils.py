@@ -245,6 +245,7 @@ def init_wandb(cfg, rank, logger = None):
         }
         
         # ✅ GESTION DE LA REPRISE
+        resume_id = None
         if resume_id:
             base_config.update({
                 'id': resume_id,

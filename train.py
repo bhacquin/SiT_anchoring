@@ -34,7 +34,7 @@ import signal
 import os
 from datetime import datetime, timedelta
 
-from utils import get_config_info, get_layer_by_name, compute_entropy
+from utils import get_config_info, get_layer_by_name, compute_entropy, visualize_pca_as_rgb, capture_intermediate_activations,run_pca_visualization_on_test_set
 from models import SiT_models
 from download import find_model
 from transport import create_transport, Sampler
@@ -42,150 +42,15 @@ from train_utils import init_wandb, get_layer_output_dim, create_scheduler, get_
 from diffusers.models import AutoencoderKL
 from losses import info_nce_loss, dispersive_info_nce_loss
 import wandb_utils
+import wandb
+import matplotlib.pyplot as plt
+
+
 
 
 #################################################################################
 #                             Training Helper Functions                         #
 #################################################################################
-# def setup_timeout_signal_handler(checkpoint_dir, model, ema, opt, scaler, lr_scheduler, logger, cfg):
-#     """Configure un signal handler pour sauvegarder et relancer automatiquement"""
-    
-#     def timeout_handler(signum, frame):
-#         if logger:
-#             logger.warning("⏰ Timeout SLURM imminent, sauvegarde d'urgence et relance...")
-#         try:
-#             if cfg.get('wandb', False) and wandb.run is not None:
-#                 wandb.run.mark_preempting()
-#                 logger.info("📊 Wandb run marked as preempting")
-#                 # ✅ FINIR LE RUN PROPREMENT
-#                 wandb.finish(quiet=True)
-#                 if logger:
-#                     logger.info("📊 Wandb run finished properly")
-#         except Exception as e:
-#             if logger:
-#                 logger.warning(f"⚠️ Could not mark wandb preempting: {e}")
-        
-#         # ✅ SAUVEGARDER LE WANDB RUN ID
-#         wandb_run_id = None
-#         wandb_run_name = None
-#         if cfg.get('wandb', False) and wandb.run is not None:
-#             wandb_run_id = wandb.run.id
-#             wandb_run_name = wandb.run.name
-#             logger.info(f"📊 Sauvegarde wandb run_id: {wandb_run_id}")
-        
-#         # Récupérer la valeur actuelle de train_steps depuis les globals
-#         current_train_steps = globals().get('train_steps', 0)
-        
-#         # Sauvegarder immédiatement
-#         emergency_path = f"{checkpoint_dir}/emergency_checkpoint_{current_train_steps}.pt"
-#         config_dict = OmegaConf.to_container(cfg, resolve=True)  # Convertir en dict standard
-#         checkpoint = {
-#             "model": model.module.state_dict() if hasattr(model, 'module') else model.state_dict(),
-#             "ema": ema.state_dict(),
-#             "opt": opt.state_dict(),
-#             "scaler": scaler.state_dict() if scaler else None,
-#             "scheduler": lr_scheduler.state_dict() if lr_scheduler else None,
-#             "train_steps": current_train_steps,
-#             "timestamp": datetime.now().isoformat(),
-#             "cfg": config_dict,  # Ajouter la config complète
-#             "emergency_save": True,
-#         }
-        
-#         torch.save(checkpoint, emergency_path)
-#         if logger:
-#             logger.info(f"💾 Sauvegarde d'urgence: {emergency_path}")
-        
-#         # ✅ NOUVEAU: Créer une config modifiée et relancer
-#         relaunch_training(emergency_path, cfg, logger, wandb_run_id, wandb_run_name)
-    
-#     # Configurer les signaux
-#     signal.signal(signal.SIGTERM, timeout_handler)
-#     signal.signal(signal.SIGUSR1, timeout_handler)
-    
-#     if logger:
-#         logger.info("⏰ Signal handler configuré pour sauvegarde d'urgence et relance")
-
-# def relaunch_training(emergency_checkpoint_path, original_cfg, logger, wandb_run_id, wandb_run_name):
-#     """Relancer l'entraînement avec le checkpoint d'urgence"""
-    
-#     try:
-#         # Créer une copie de la config avec le nouveau checkpoint
-#         new_cfg = OmegaConf.structured(original_cfg)
-#         new_cfg.ckpt = emergency_checkpoint_path
-        
-#         # ✅ AJOUTER LES INFOS WANDB À LA CONFIG
-#         if wandb_run_id:
-#             new_cfg.wandb_resume_id = wandb_run_id
-#             new_cfg.wandb_resume_name = wandb_run_name
-#             if logger:
-#                 logger.info(f"📊 Config mise à jour avec wandb run_id: {wandb_run_id}")
-        
-#         # ✅ Créer un fichier YAML réel à côté du checkpoint
-#         checkpoint_dir = Path(emergency_checkpoint_path).parent
-#         config_filename = f"resume_config_{Path(emergency_checkpoint_path).stem}.yaml"
-#         config_path = checkpoint_dir / config_filename
-        
-#         # Sauvegarder la config modifiée
-#         with open(config_path, 'w') as f:
-#             OmegaConf.save(new_cfg, f)
-        
-#         if logger:
-#             logger.info(f"📝 Config de reprise sauvegardée: {config_path}")
-#             logger.info(f"🔄 Checkpoint configuré: {emergency_checkpoint_path}")
-#         print(f"📝 Config de reprise sauvegardée: {config_path}")
-#         print(f"🔄 Checkpoint configuré: {emergency_checkpoint_path}")
-#         # Déterminer le nombre de nœuds depuis l'environnement SLURM
-#         num_nodes = int(os.environ.get('SLURM_JOB_NUM_NODES', 1))
-#         gpus_per_node = int(os.environ.get('SLURM_GPUS_ON_NODE', 4))
-        
-#         if logger:
-#             logger.info(f"🖥️  Relance avec {num_nodes} nœuds, {gpus_per_node} GPUs par nœud")
-#         print(f"🖥️  Relance avec {num_nodes} nœuds, {gpus_per_node} GPUs par nœud")
-        
-#         # Construire la commande sbatch
-#         # Utiliser le script run_test.sh existant mais avec la nouvelle config
-#         cmd = [
-#             "sbatch",
-#             "--nodes", str(num_nodes),
-#             "--gpus-per-node", str(gpus_per_node),
-#             "--cpus-per-task", "32",  # Ajuster selon vos besoins
-#             "--ntasks-per-node", "4",  # Ajuster selon vos besoins
-#             "--time", "00:04:00",  # Durée maximale de 12 heures
-#             "--job-name", "sit_anchoring",
-#             "--partition", "normal",
-#             "--account", "a144",
-#             "--exclude", "nid005687,nid005911,nid005364,nid005247,nid005227,nid005236,nid005462,nid005340",
-#             "--output", "logs/training_cluster_%j_%x_.out",
-#             "--error", "logs/training_cluster_%j_%x.err",
-#             "run_test.sh",
-#             f"--config-file={config_path}"
-#         ]
-          
-#         if logger:
-#             logger.info(f"🚀 Commande de relance: {' '.join(cmd)}")
-#         print(f"🚀 Commande de relance: {' '.join(cmd)}")
-#         # Lancer la nouvelle soumission
-#         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        
-#         if result.returncode == 0:
-#             new_job_id = result.stdout.strip().split()[-1]  # Le job ID est généralement le dernier mot
-#             if logger:
-#                 logger.info(f"✅ Nouveau job soumis: {new_job_id}")
-#                 logger.info(f"📋 Config utilisée: {config_path}")
-#             print(f"✅ Nouveau job soumis: {new_job_id}")
-#             print(f"📋 Config utilisée: {config_path}")
-#         else:
-#             if logger:
-#                 logger.error(f"❌ Échec de la relance: {result.stderr}")
-        
-#     except Exception as e:
-#         if logger:
-#             logger.error(f"❌ Erreur lors de la relance: {e}")
-    
-#     finally:
-#         # Sortie propre
-#         os._exit(0)
-
 def setup_timeout_signal_handler(checkpoint_dir, model, ema, opt, scaler, lr_scheduler, logger, cfg):
     """Configure un signal handler pour sauvegarder et relancer automatiquement"""
     
@@ -536,7 +401,7 @@ def center_crop_arr(pil_image, image_size):
 
 
 #################################################################################
-#                                  Training Loop                                #
+#                                  Training MAIN                                #
 #################################################################################
 from utils import get_config_info
 # Get config path and name from command line or environment variables
@@ -622,6 +487,7 @@ def main(cfg: DictConfig):
         experiment_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
         checkpoint_dir = f"{experiment_dir}/checkpoints"
         os.makedirs(checkpoint_dir, exist_ok=True)
+        print(f"cfg.logging_level: {cfg.logging_level}")
         if cfg.logging_level == 'debug':
             logger = create_logger(experiment_dir, level=logging.DEBUG)
         elif cfg.logging_level == 'info':
@@ -635,11 +501,6 @@ def main(cfg: DictConfig):
         
         logger.info(f"Experiment directory created at {experiment_dir}")
         logger.info(f"Configuration:\n{OmegaConf.to_yaml(cfg)}")
-        # if cfg.wandb:
-        #     entity = os.environ.get("ENTITY", "default_entity")
-        #     project = os.environ.get("PROJECT", "SiT_training")
-        #     experiment_name = os.path.basename(experiment_dir)
-        #     wandb_utils.initialize(cfg, entity, experiment_name, project)
     else:
         logger = create_logger(None)
 
@@ -649,11 +510,21 @@ def main(cfg: DictConfig):
     # Create model:
     assert cfg.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
     latent_size = cfg.image_size // 8
+
+    encoder_depth = cfg.get('encoder_depth',[3])
+    use_projectors = cfg.get('use_projectors', [True])
+    z_dims = cfg.get('z_dims', [768])
+
     model = SiT_models[cfg.model](
         input_size=latent_size,
         num_classes=cfg.num_classes,
-        use_time=cfg.get('use_time', True)  # Use time embeddings if specified
+        use_time=cfg.get('use_time', True),  # Use time embeddings if specified
+        encoder_depth=encoder_depth,
+        use_projectors=use_projectors,
+        z_dims=z_dims,
+        learn_sigma=cfg.get('learn_sigma', True)
     )
+    
     if logger:
         logger.info(f"Using time as a condition: {cfg.get('use_time', True) }")
     # Note that parameter initialization is done within the SiT constructor
@@ -673,22 +544,18 @@ def main(cfg: DictConfig):
                 logger.warning(f"⚠️ Failed to load with weights_only=True: {str(e)}")
                 logger.warning("Falling back to weights_only=False. Ensure checkpoint is trusted.")
             checkpoint = torch.load(ckpt_path, weights_only=False, map_location='cpu')
-        
-        # checkpoint = torch.load(ckpt_path, weights_only=False, map_location='cpu')  # Use weights_only=False to load the full model state
         model.load_state_dict(checkpoint["model"])
         ema.load_state_dict(checkpoint["ema"])
         # Note: optimizer will be created after this, so we'll load its state later
-        # cfg will be used as is (no overriding from checkpoint)
 
-    requires_grad(ema, False)
-    
+    requires_grad(ema, False)    
     model = DDP(model, device_ids=[local_rank])
     transport = create_transport(
         cfg.path_type,
         cfg.prediction,
         cfg.loss_weight,
         cfg.train_eps,
-        cfg.sample_eps
+        cfg.sample_eps,
     )  # default: velocity; 
     transport_sampler = Sampler(transport)
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{cfg.vae}").to(device)
@@ -737,12 +604,13 @@ def main(cfg: DictConfig):
     activation_feature_dim = None
     layer_outputs = []
     hook_handle = None
-    use_contrastive = getattr(cfg, 'use_contrastive_loss', False)   
+    use_contrastive_loss = getattr(cfg, 'use_contrastive_loss', False) 
+    use_dispersive_loss = getattr(cfg, 'use_dispersive_loss', False)  
 
     def hook_fn(module, input, output):
         layer_outputs.append(output)
-    # print("[DEBUG] cfg.use_contrastive_loss", use_contrastive)
-    if use_contrastive:
+    # print("[DEBUG] cfg.use_contrastive_loss", use_contrastive_loss)
+    if use_contrastive_loss or use_dispersive_loss:
         # Configurer le hook pour capturer les activations
         target_layer_name = getattr(cfg, 'contrastive_layer', 'blocks.8')  # Couche du milieu par défaut
         target_layer = get_layer_by_name(model.module, target_layer_name)
@@ -796,6 +664,13 @@ def main(cfg: DictConfig):
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
     ])
+
+    # ✅ SETUP VALIDATION TRANSFORM (no random flip)
+    test_transform = transforms.Compose([
+        transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, cfg.image_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
+    ])
     
     # Check if data_path is provided, otherwise use HuggingFace datasets
     if not hasattr(cfg, 'data_path') or cfg.data_path is None or cfg.data_path == "":
@@ -805,6 +680,13 @@ def main(cfg: DictConfig):
         hf_dataset = load_dataset(
             cfg.dataset_name,
             split=cfg.dataset_split,
+            streaming=False,
+            cache_dir=cfg.get("cache_dir", None),
+            trust_remote_code=True
+        )
+        test_hf_dataset = load_dataset(
+            cfg.dataset_name,
+            split='train',
             streaming=False,
             cache_dir=cfg.get("cache_dir", None),
             trust_remote_code=True
@@ -833,12 +715,13 @@ def main(cfg: DictConfig):
                 return image, label
         
         dataset = HFDatasetWrapper(hf_dataset, transform=transform)
+        test_dataset = HFDatasetWrapper(test_hf_dataset, transform=test_transform)
         logger.info(f"Loaded HuggingFace dataset with {len(dataset):,} images")
     else:
         # Use local ImageFolder dataset
         dataset = ImageFolder(cfg.data_path, transform=transform)
         logger.info(f"Dataset contains {len(dataset):,} images ({cfg.data_path})")
-    
+    # Train
     sampler = DistributedSampler(
         dataset,
         num_replicas=dist.get_world_size(),
@@ -855,7 +738,20 @@ def main(cfg: DictConfig):
         pin_memory=True,
         drop_last=True
     )
-
+    # Test
+    # ✅ Test loader (only on rank 0 to save resources)
+    test_loader = None
+    test_iter = None
+    if rank == 0:
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=min(getattr(cfg, 'test_batch_size', 10), local_batch_size),  # Smaller batch for visualization
+            shuffle=False,
+            num_workers=cfg.num_workers,
+            pin_memory=True
+        )
+        test_iter = iter(test_loader)  # ✅ Initialize iterator
+        logger.info(f"Test dataset loaded: {len(test_dataset):,} images")
     # Setup scheduler
     total_steps = len(loader) * cfg.epochs
     lr_scheduler, scheduler_update_mode = create_scheduler(opt, cfg, total_steps)
@@ -936,290 +832,322 @@ def main(cfg: DictConfig):
     else:
         sample_model_kwargs = dict(y=ys)
         model_fn = ema.forward
-
+    activate_handler = False
     logger.info(f"Training for {cfg.epochs} epochs...")
-    if rank == 0:
-        setup_timeout_signal_handler(
-            checkpoint_dir=checkpoint_dir,
-            model=model,
-            ema=ema,
-            opt=opt,
-            scaler=scaler,
-            lr_scheduler=lr_scheduler,
-            logger=logger,
-            cfg=cfg,
-        )
+    if rank == 0 and activate_handler:
+        # ✅ Vérifier si le code s'exécute dans un job SLURM
+        is_on_slurm = "SLURM_JOB_ID" in os.environ
+        if is_on_slurm:
+            logger.info("✅ SLURM environment detected. Setting up timeout signal handler.")
+            setup_timeout_signal_handler(
+                checkpoint_dir=checkpoint_dir,
+                model=model,
+                ema=ema,
+                opt=opt,
+                scaler=scaler,
+                lr_scheduler=lr_scheduler,
+                logger=logger,
+                cfg=cfg,
+            )
+        else:
+            logger.info("⚪ Not running on SLURM. Timeout signal handler will not be set.")
+
+#################################################################################
+#                                  Training Loop                                #
+#################################################################################
     for epoch in range(start_epoch, cfg.epochs):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
-        for batch_idx, (x, y) in enumerate(loader):
-            # ✅ SKIP LES BATCHES DÉJÀ TRAITÉS DANS L'EPOCH ACTUELLE
-            if epoch == start_epoch and batch_idx < remaining_steps_in_epoch:
-                if rank == 0 and batch_idx % 1000 == 0:  # Log progress occasionally
-                    logger.debug(f"Skipping batch {batch_idx}/{remaining_steps_in_epoch}")
-                continue
-            x = x.to(device)
-            y = y.to(device)
-            
-            # VAE encoding (toujours en fp32)
-            with torch.no_grad():
-                # Map input images to latent space + normalize latents:
-                # VAE sempre en fp32 pour plus de fiabilité
-                x_clean = vae.encode(x).latent_dist.sample().mul_(0.18215)
-            
-            # ========== PERTE DE DIFFUSION + CAPTURE D'ACTIVATIONS ==========
-            model_kwargs = dict(y=y)
-            
-            # Clear the layer outputs before forward pass
-            layer_outputs.clear()
-            
-            # Déterminer le nombre d'échantillons pour le contrastive
-            k_samples = getattr(cfg, 'contrastive_num_noisy_versions', 1) if use_contrastive else 1
-            # Forward pass avec capture d'activations
-            if use_amp:
-                with autocast(dtype=autocast_dtype):
+        logger.info(f"Remaining steps in epoch {epoch}: {remaining_steps_in_epoch}")
+        data_iter = iter(loader)
+
+        try:
+            while True:
+                x, y = next(data_iter)
+                x = x.to(device)
+                y = y.to(device)             
+                # VAE encoding (toujours en fp32)
+                with torch.no_grad():
+                    # Map input images to latent space + normalize latents:
+                    x_clean = vae.encode(x).latent_dist.sample().mul_(0.18215)
+                
+                # ========== PERTE DE DIFFUSION + CAPTURE D'ACTIVATIONS ==========
+                model_kwargs = dict(y=y)
+                
+                # Clear the layer outputs before forward pass
+                layer_outputs.clear()
+                
+                # Déterminer le nombre d'échantillons pour le contrastive
+                k_samples = getattr(cfg, 'contrastive_num_noisy_versions', 1) if use_contrastive_loss else 1
+                # Forward pass avec capture d'activations
+                if use_amp:
+                    with autocast(dtype=autocast_dtype):
+                        loss_dict = transport.training_losses(
+                            model, x_clean, model_kwargs, k=k_samples
+                        )
+                        diffusion_loss = loss_dict["loss"]
+                        activations = loss_dict["activations"] if "activations" in loss_dict else None
+                else:
                     loss_dict = transport.training_losses(
                         model, x_clean, model_kwargs, k=k_samples
                     )
                     diffusion_loss = loss_dict["loss"]
-            else:
-                loss_dict = transport.training_losses(
-                    model, x_clean, model_kwargs, k=k_samples
-                )
-                diffusion_loss = loss_dict["loss"]
-            
-            # Copier les activations capturées
-            # all_activations = layer_outputs.copy() if use_contrastive else []
-            # print(f"[DEBUG] all_activations length: {len(all_activations)}, shape of first activation: {all_activations[0].shape}")
-            # ========== PERTE CONTRASTIVE (si activée) ==========
-            contrastive_loss = 0.0
-            if use_contrastive:
-                # Utiliser directement les activations capturées
-                # all_activations[0] contient toutes les activations de forme (batch_size * k_samples, feature_dim)
-                features = layer_outputs[0]
-                B_times_k, number_of_patches, internal_dim = features.shape
-                layer_outputs.clear()
-                batch_size = x_clean.size(0)
+                    activations = loss_dict["activations"] if "activations" in loss_dict else None
 
-            if use_contrastive and cfg.use_divergent_only:
-                if logger and train_steps < 1:
-                    logger.info(f"Using divergent only contrastive loss with {k_samples} samples")
-                contrastive_loss = dispersive_info_nce_loss(features, temperature = cfg.contrastive_temperature,norm=cfg.use_norm_in_dispersive, logger = logger, use_l2=cfg.use_l2_in_dispersive,)
-                if logger:
-                    logger.debug(f"divergent_loss: {contrastive_loss.item():.6f}")
-            elif use_contrastive and k_samples > 1:
-                activations = features.view(batch_size, k_samples, number_of_patches, internal_dim) 
-                if getattr(cfg, 'use_mlp_for_pairwise', False):
-                    activations = mlp(activations)  # Appliquer MLP si configuré B * K * N * dim
-                # Vérification précoce des activations du modèle
-                if not torch.isfinite(activations).all():
-                    if logger:
-                        logger.error(f"Non-finite activations from model! NaN count: {torch.isnan(activations).sum()}, Inf count: {torch.isinf(activations).sum()}")
-                        logger.error(f"Activation stats: min={activations.min():.6f}, max={activations.max():.6f}, mean={activations.mean():.6f}")
-                    # Nettoyer les activations
-                    activations = torch.nan_to_num(activations, nan=0.0, posinf=10.0, neginf=-10.0)
-                    # Optionnel: clamper pour éviter des valeurs extrêmes
-                    activations = torch.clamp(activations, -10.0, 10.0)
+                # ========== PERTE CONTRASTIVE (si activée) ==========
+                contrastive_loss = 0.0
+                if use_contrastive_loss or use_dispersive_loss:
 
-                ## Entropy logging
-                if getattr(cfg, 'log_entropy', False) and train_steps % cfg.log_entropy_every == 0:
+                    features = layer_outputs[0]
+                    features = activations[0]
+                    B_times_k, number_of_patches, internal_dim = features.shape
+                    layer_outputs.clear()
+                    batch_size = x_clean.size(0)
+
+                if use_dispersive_loss:
+                    if logger and train_steps < 1:
+                        logger.info(f"Using dispersive only contrastive loss with {k_samples} samples")
+                    contrastive_loss = dispersive_info_nce_loss(features, temperature = cfg.contrastive_temperature, norm=cfg.use_norm_in_dispersive, logger = logger, use_l2=cfg.use_l2_in_dispersive,)
                     if logger:
-                        logger.debug(f"Calculating entropy for activations of shape {activations.shape}")
-                    entropy_vectors = activations.reshape(-1, activations.shape[-1]*activations.shape[-2])
-                    entropy_mlp = compute_entropy(entropy_vectors)
-                    if logger and rank == 0:
-                        logger.info(f"Entropy (activation): {entropy_mlp:.6f} at step {train_steps}")
-                        log_dict = {"train/entropy_activation": entropy_mlp}
+                        logger.debug(f"dispersive_loss: {contrastive_loss.item():.6f}")
+
+                elif use_contrastive_loss and k_samples > 1: ##TODO Change the way the k samples are handled probably outa batch and sg()
+                    activations = features.view(batch_size, k_samples, number_of_patches, internal_dim) 
+                    if getattr(cfg, 'use_mlp_for_pairwise', False):
+                        activations = mlp(activations)  # Appliquer MLP si configuré B * K * N * dim
+                    # Vérification précoce des activations du modèle
+                    if not torch.isfinite(activations).all():
+                        if logger:
+                            logger.error(f"Non-finite activations from model! NaN count: {torch.isnan(activations).sum()}, Inf count: {torch.isinf(activations).sum()}")
+                            logger.error(f"Activation stats: min={activations.min():.6f}, max={activations.max():.6f}, mean={activations.mean():.6f}")
+                        # Nettoyer les activations
+                        activations = torch.nan_to_num(activations, nan=0.0, posinf=10.0, neginf=-10.0)
+                        # Optionnel: clamper pour éviter des valeurs extrêmes
+                        activations = torch.clamp(activations, -10.0, 10.0)
+                    ## Entropy logging
+                    if getattr(cfg, 'log_entropy', False) and train_steps % cfg.log_entropy_every == 0:
+                        if logger:
+                            logger.debug(f"Calculating entropy for activations of shape {activations.shape}")
+                        entropy_vectors = activations.reshape(-1, activations.shape[-1]*activations.shape[-2])
+                        entropy_mlp = compute_entropy(entropy_vectors)
+                        if logger and rank == 0:
+                            logger.info(f"Entropy (activation): {entropy_mlp:.6f} at step {train_steps}")
+                            log_dict = {"train/entropy_activation": entropy_mlp}
+                            if cfg.wandb and wandb_initialised:
+                                wandb_utils.log(log_dict, step=train_steps)
+
+                    # Debug: vérifier les gradients avant la perte contrastive
+                    if cfg.get('debug_contrastive', False) and train_steps < 2:
+                        if logger:
+                            logger.debug(f"activations: {activations}")
+                            logger.debug(f"activations.requires_grad: {activations.requires_grad}")
+                            logger.debug(f"activations shape: {activations.shape}")
+                            logger.debug(f"batch_size: {batch_size}, k_samples: {k_samples}")
+                            logger.debug(f"activations is_leaf: {activations.is_leaf}")
+                            logger.debug(f"activations.grad_fn: {activations.grad_fn}")
+
+                    # S'assurer que les activations gardent les gradients
+                    if not activations.requires_grad:
+                        print(f"[WARNING] Activations don't require grad! Enabling...")
+                        activations = activations.requires_grad_(True)
+
+                    contrastive_loss, mean_pos_sim, mean_neg_sim = info_nce_loss(activations, temperature = cfg.contrastive_temperature, logger = logger, 
+                                                                sample_weights = None) 
+                    # Debug: vérifier la perte contrastive
+                    if cfg.get('debug_contrastive', False) and train_steps < 2:
+                        if logger:
+                            logger.debug(f"contrastive_loss: {contrastive_loss.item():.6f}")
+                            logger.debug(f"mean_pos_sim: {mean_pos_sim:.6f}, mean_neg_sim: {mean_neg_sim:.6f}")
+                            logger.debug(f"contrastive_loss.requires_grad: {contrastive_loss.requires_grad}")
+                            logger.debug(f"contrastive_loss.grad_fn: {contrastive_loss.grad_fn}")
+                else:
+                    if logger:
+                        logger.debug("Skipping contrastive loss computation (not enabled or k_samples=1)")
+                        contrastive_loss = 0.0
+
+                # ========== COMBINAISON DES PERTES ==========
+                contrastive_weight = getattr(cfg, 'contrastive_weight', 0.1)
+                total_loss = diffusion_loss + contrastive_weight * contrastive_loss
+                            
+                # Vérification finale que total_loss est un scalaire
+                if total_loss.numel() != 1:
+                    if rank == 0:
+                        logger.warning(f"⚠️ total_loss is not scalar! Shape: {total_loss.shape}, taking mean...")
+                    total_loss = total_loss.mean()
+
+                # ========== BACKWARD PASS ==========
+                opt.zero_grad()   
+                # Backward pass with gradient scaling if using fp16
+                if scaler is not None:  # fp16 case
+                    scaler.scale(total_loss).backward()
+                    scaler.step(opt)
+                    scaler.update()
+                else:  # bf16 or fp32 case
+                    total_loss.backward()
+                    opt.step()
+
+                # ========== SCHEDULER STEP ==========
+                if lr_scheduler and scheduler_update_mode == "step":
+                    lr_scheduler.step()
+                    
+                update_ema(ema, model.module)
+
+                # ========== LOGGING ==========
+                running_loss += diffusion_loss.item()
+                log_steps += 1
+                train_steps += 1
+
+                if train_steps % cfg.log_every == 0:
+                    # Measure training speed:
+                    torch.cuda.synchronize()
+                    end_time = time()
+                    steps_per_sec = log_steps / (end_time - start_time)
+                    # Reduce loss history over all processes:
+                    avg_diffusion_loss = torch.tensor(running_loss / log_steps, device=device)
+                    dist.all_reduce(avg_diffusion_loss, op=dist.ReduceOp.SUM)
+                    avg_diffusion_loss = avg_diffusion_loss.item() / dist.get_world_size()
+                    
+                    # LOG UNIQUEMENT DEPUIS RANK 0
+                    if rank == 0:
+                        log_msg = f"(step={train_steps:07d}) Diffusion Loss: {avg_diffusion_loss:.4f}"
+                        log_dict = {"train/diffusion_loss": avg_diffusion_loss, "train/steps_per_sec": steps_per_sec}
+                        current_lr = opt.param_groups[0]['lr']
+                        log_dict["train/lr"] = current_lr
+                        if isinstance(contrastive_loss, torch.Tensor):
+                            contrastive_val = contrastive_loss.item()
+                            total_val = total_loss.item()
+                            if use_dispersive_loss:
+                                log_msg += f", Dispersive Loss: {contrastive_val:.4f}, Total Loss: {total_val:.4f}"
+                                log_dict.update({
+                                    "train/dispersive_loss": contrastive_val,
+                                    "train/total_loss": total_val})
+                            elif use_contrastive_loss:
+                                log_msg += f", Contrastive Loss: {contrastive_val:.4f}, Total Loss: {total_val:.4f}"
+                                log_dict.update({
+                                    "train/contrastive_loss": contrastive_val,
+                                    "train/total_loss": total_val})
+                            else:
+                                log_msg += f", Extra Loss: {contrastive_val:.4f}, Total Loss: {total_val:.4f}"
+                                log_dict.update({
+                                    "train/extra_loss": contrastive_val,
+                                    "train/total_loss": total_val})
+                            if 'mean_pos_sim' in locals():
+                                log_dict.update({
+                                "train/mean_pos_sim": mean_pos_sim,
+                                "train/mean_neg_sim": mean_neg_sim 
+                            })
+                        log_msg += f", LR: {current_lr:.2e}"
+                        logger.info(log_msg)
+                        
                         if cfg.wandb and wandb_initialised:
                             wandb_utils.log(log_dict, step=train_steps)
-
-                # Debug: vérifier les gradients avant la perte contrastive
-                if cfg.get('debug_contrastive', False) and train_steps < 2:
-                    if logger:
-                        logger.debug(f"activations: {activations}")
-                        logger.debug(f"activations.requires_grad: {activations.requires_grad}")
-                        logger.debug(f"activations shape: {activations.shape}")
-                        logger.debug(f"batch_size: {batch_size}, k_samples: {k_samples}")
-                        logger.debug(f"activations is_leaf: {activations.is_leaf}")
-                        logger.debug(f"activations.grad_fn: {activations.grad_fn}")
-
-                # S'assurer que les activations gardent les gradients
-                if not activations.requires_grad:
-                    print(f"[WARNING] Activations don't require grad! Enabling...")
-                    activations = activations.requires_grad_(True)
-
-                # Calculer la perte contrastive avec la nouvelle implémentation simple
-                # contrastive_loss = contrastive_loss_fn(features, batch_size, k_samples)
-
-                contrastive_loss, mean_pos_sim, mean_neg_sim = info_nce_loss(activations, temperature = cfg.contrastive_temperature, logger = logger, 
-                                                            sample_weights = None, use_divergent_only = cfg.use_divergent_only) 
-                # Debug: vérifier la perte contrastive
-                if cfg.get('debug_contrastive', False) and train_steps < 2:
-                    if logger:
-                        logger.debug(f"contrastive_loss: {contrastive_loss.item():.6f}")
-                        logger.debug(f"mean_pos_sim: {mean_pos_sim:.6f}, mean_neg_sim: {mean_neg_sim:.6f}")
-                        logger.debug(f"contrastive_loss.requires_grad: {contrastive_loss.requires_grad}")
-                        logger.debug(f"contrastive_loss.grad_fn: {contrastive_loss.grad_fn}")
-            else:
-                if logger:
-                    logger.debug("Skipping contrastive loss computation (not enabled or k_samples=1)")
-                    contrastive_loss = 0.0
-
-
-            # ========== COMBINAISON DES PERTES ==========
-            contrastive_weight = getattr(cfg, 'contrastive_weight', 0.1)
-            total_loss = diffusion_loss + contrastive_weight * contrastive_loss
-                           
-            # Vérification finale que total_loss est un scalaire
-            if total_loss.numel() != 1:
-                if rank == 0:
-                    logger.warning(f"⚠️ total_loss is not scalar! Shape: {total_loss.shape}, taking mean...")
-                total_loss = total_loss.mean()
-
-            # ========== BACKWARD PASS ==========
-            opt.zero_grad()
-            
-            # Backward pass with gradient scaling if using fp16
-            if scaler is not None:  # fp16 case
-                scaler.scale(total_loss).backward()
-                scaler.step(opt)
-                scaler.update()
-            else:  # bf16 or fp32 case
-                total_loss.backward()
-                opt.step()
-
-            # ========== SCHEDULER STEP ==========
-            if lr_scheduler and scheduler_update_mode == "step":
-                lr_scheduler.step()
-                
-            update_ema(ema, model.module)
-
-            # ========== LOGGING ==========
-            running_loss += diffusion_loss.item()
-            log_steps += 1
-            train_steps += 1
-
-            if train_steps % cfg.log_every == 0:
-                # Measure training speed:
-                torch.cuda.synchronize()
-                end_time = time()
-                steps_per_sec = log_steps / (end_time - start_time)
-                # Reduce loss history over all processes:
-                avg_diffusion_loss = torch.tensor(running_loss / log_steps, device=device)
-                dist.all_reduce(avg_diffusion_loss, op=dist.ReduceOp.SUM)
-                avg_diffusion_loss = avg_diffusion_loss.item() / dist.get_world_size()
-                
-                # LOG UNIQUEMENT DEPUIS RANK 0
-                if rank == 0:
-                    log_msg = f"(step={train_steps:07d}) Diffusion Loss: {avg_diffusion_loss:.4f}"
-                    log_dict = {"train/diffusion_loss": avg_diffusion_loss, "train/steps_per_sec": steps_per_sec}
-                    current_lr = opt.param_groups[0]['lr']
-                    log_dict["train/lr"] = current_lr
-                    if isinstance(contrastive_loss, torch.Tensor):
-                        contrastive_val = contrastive_loss.item()
-                        total_val = total_loss.item()
-                        if cfg.use_divergent_only:
-                            log_msg += f", Divergent Loss: {contrastive_val:.4f}, Total Loss: {total_val:.4f}"
-                        else:
-                            log_msg += f", Contrastive Loss: {contrastive_val:.4f}, Total Loss: {total_val:.4f}"
-                        log_dict.update({
-                            "train/contrastive_loss": contrastive_val,
-                            "train/total_loss": total_val})
-                        if 'mean_pos_sim' in locals():
-                            log_dict.update({
-                            "train/mean_pos_sim": mean_pos_sim,
-                            "train/mean_neg_sim": mean_neg_sim 
-                        })
-                    log_msg += f", LR: {current_lr:.2e}"
-                    logger.info(log_msg)
                     
-                    if cfg.wandb and wandb_initialised:
-                        wandb_utils.log(log_dict, step=train_steps)
-                
-                # Reset monitoring variables:
-                running_loss = 0
-                log_steps = 0
-                start_time = time()
+                    # Reset monitoring variables:
+                    running_loss = 0
+                    log_steps = 0
+                    start_time = time()
 
-            # Save SiT checkpoint:
-            if train_steps % cfg.ckpt_every == 0 and train_steps > 0:
-                if rank == 0:
-                    checkpoint = {
-                        "model": model.module.state_dict(),
-                        "ema": ema.state_dict(),
-                        "opt": opt.state_dict(),
-                        "train_steps": train_steps,
-                        "epoch": epoch,  # Optionnel si vous voulez sauvegarder l'epoch
-                        # "cfg": cfg,
-                        "scaler": scaler.state_dict() if scaler is not None else None,
-                        "scheduler": lr_scheduler.state_dict() if lr_scheduler else None # ✅ SAUVEGARDER LE SCHEDULER
-                    }
-                    # Sauvegarder la config séparément si nécessaire
-                    config_dict = OmegaConf.to_container(cfg, resolve=True)  # Convertir en dict standard
-                    checkpoint["cfg"] = config_dict  # Dict standard compatible avec weights_only=True
-                    checkpoint_path = f"{checkpoint_dir}/{epoch}_{train_steps:07d}.pt"
-                    torch.save(checkpoint, checkpoint_path)
-                    logger.info(f"Saved checkpoint to {checkpoint_path}")
-                dist.barrier()
-            
-            if train_steps % cfg.sample_every == 0 and train_steps > 0:
-                if rank == 0:
-                    logger.info("Generating EMA samples...")
-                
-                # Nombre réduit d'images pour sampling (au lieu de global_batch_size)
-                num_sample_images = getattr(cfg, 'num_sample_images', 8)
-                
-                # Créer un batch plus petit pour sampling
-                sample_labels = torch.randint(0, cfg.num_classes, (num_sample_images,), device=device)
-                use_cfg = cfg.cfg_scale > 1.0
-                
-                if use_cfg:
-                    # Pour CFG, on double le batch (uncond + cond)
-                    z_sample = torch.randn(num_sample_images * 2, 4, latent_size, latent_size, device=device)
-                    y_null = torch.tensor([1000] * num_sample_images, device=device)
-                    sample_labels_cfg = torch.cat([sample_labels, y_null], 0)
-                    sample_model_kwargs_local = dict(y=sample_labels_cfg, cfg_scale=cfg.cfg_scale)
-                    model_fn_local = ema.forward_with_cfg
-                else:
-                    z_sample = torch.randn(num_sample_images, 4, latent_size, latent_size, device=device)
-                    sample_model_kwargs_local = dict(y=sample_labels)
-                    model_fn_local = ema.forward
-                
-                # S'assurer que le modèle EMA est en mode évaluation
-                ema.eval()
-                
-                with torch.no_grad():
-                    # Sampling with mixed precision
-                    sample_fn = transport_sampler.sample_ode() # default to ode sampling
-                    if use_amp:
-                        with autocast(dtype=autocast_dtype):
-                            samples = sample_fn(z_sample, model_fn_local, **sample_model_kwargs_local)[-1]
-                    else:
-                        samples = sample_fn(z_sample, model_fn_local, **sample_model_kwargs_local)[-1]
-                    
+                # Save SiT checkpoint:
+                if train_steps % cfg.ckpt_every == 0 and train_steps > 0:
+                    if rank == 0:
+                        checkpoint = {
+                            "model": model.module.state_dict(),
+                            "ema": ema.state_dict(),
+                            "opt": opt.state_dict(),
+                            "train_steps": train_steps,
+                            "epoch": epoch,  # Optionnel si vous voulez sauvegarder l'epoch
+                            "scaler": scaler.state_dict() if scaler is not None else None,
+                            "scheduler": lr_scheduler.state_dict() if lr_scheduler else None # ✅ SAUVEGARDER LE SCHEDULER
+                        }
+                        # Sauvegarder la config séparément si nécessaire
+                        config_dict = OmegaConf.to_container(cfg, resolve=True)  # Convertir en dict standard
+                        checkpoint["cfg"] = config_dict  # Dict standard compatible avec weights_only=True
+                        checkpoint_path = f"{checkpoint_dir}/{epoch}_{train_steps:07d}.pt"
+                        torch.save(checkpoint, checkpoint_path)
+                        logger.info(f"Saved checkpoint to {checkpoint_path}")
                     dist.barrier()
-
-                    if use_cfg: # Remove null samples
-                        samples, _ = samples.chunk(2, dim=0)
-                    
-                    # VAE decode sempre en fp32 pour plus de fiabilité
-                    samples = vae.decode(samples / 0.18215).sample
                 
-                # Gather samples from all processes (mais maintenant beaucoup plus petit!)
-                out_samples = torch.zeros((num_sample_images * dist.get_world_size(), 3, cfg.image_size, cfg.image_size), device=device)
-                dist.all_gather_into_tensor(out_samples, samples)
-                
-                if rank == 0:
-                    # Prendre seulement les premières images pour logging (éviter duplications)
-                    log_samples = out_samples[:num_sample_images]
+                if train_steps % cfg.sample_every == 0 and train_steps > 0:
+                    if rank == 0:
+                        logger.info("Generating EMA samples...")
                     
-                    if cfg.wandb and wandb_initialised:
-                        wandb_utils.log_image(log_samples, train_steps)
-                    logger.info(f"Generated and logged {num_sample_images} EMA samples.")
+                    # Nombre réduit d'images pour sampling (au lieu de global_batch_size)
+                    num_sample_images = getattr(cfg, 'num_sample_images', 8)
+                    
+                    # Créer un batch plus petit pour sampling
+                    sample_labels = torch.randint(0, cfg.num_classes, (num_sample_images,), device=device)
+                    use_cfg = cfg.cfg_scale > 1.0
+                    
+                    if use_cfg:
+                        # Pour CFG, on double le batch (uncond + cond)
+                        z_sample = torch.randn(num_sample_images * 2, 4, latent_size, latent_size, device=device)
+                        y_null = torch.tensor([1000] * num_sample_images, device=device)
+                        sample_labels_cfg = torch.cat([sample_labels, y_null], 0)
+                        sample_model_kwargs_local = dict(y=sample_labels_cfg, cfg_scale=cfg.cfg_scale)
+                        model_fn_local = ema.forward_with_cfg
+                    else:
+                        z_sample = torch.randn(num_sample_images, 4, latent_size, latent_size, device=device)
+                        sample_model_kwargs_local = dict(y=sample_labels)
+                        model_fn_local = ema.forward
+                    
+                    # S'assurer que le modèle EMA est en mode évaluation
+                    ema.eval()
+                    
+                    with torch.no_grad():
+                        # Sampling with mixed precision
+                        sample_fn = transport_sampler.sample_ode() # default to ode sampling
+                        if use_amp:
+                            with autocast(dtype=autocast_dtype):
+                                samples = sample_fn(z_sample, model_fn_local, **sample_model_kwargs_local)[-1]
+                        else:
+                            samples = sample_fn(z_sample, model_fn_local, **sample_model_kwargs_local)[-1]
+                        
+                        dist.barrier()
 
-    model.eval()  # important! This disables randomized embedding dropout
-    # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
+                        if use_cfg: # Remove null samples
+                            samples, _ = samples.chunk(2, dim=0)
+                        
+                        # VAE decode sempre en fp32 pour plus de fiabilité
+                        samples = vae.decode(samples / 0.18215).sample
+                    
+                    # Gather samples from all processes (mais maintenant beaucoup plus petit!)
+                    out_samples = torch.zeros((num_sample_images * dist.get_world_size(), 3, cfg.image_size, cfg.image_size), device=device)
+                    dist.all_gather_into_tensor(out_samples, samples)
 
+                    # ✅ CLEAN PCA VISUALIZATION ON TEST SET
+                    if rank == 0 and cfg.get('visualize_pca_rgb', True) and test_iter is not None:
+                        test_iter = run_pca_visualization_on_test_set(
+                            cfg, ema, vae, transport, test_iter, test_loader, train_steps, wandb_initialised, logger, device
+                        )
+                   
+                    if rank == 0:
+                        # Prendre seulement les premières images pour logging (éviter duplications)
+                        log_samples = out_samples[:num_sample_images]
+                        if cfg.wandb and wandb_initialised:
+                            wandb_utils.log_image(log_samples, train_steps)
+                        logger.info(f"Generated and logged {num_sample_images} EMA samples.")
+        except StopIteration:
+            # Fin de l'epoch
+            if rank == 0 and logger:
+                logger.info(f"Completed epoch {epoch}")
+            if rank == 0:
+                logger.info(f"Saving end-of-epoch checkpoint for epoch {epoch}...")
+                checkpoint = {
+                    "model": model.module.state_dict(),
+                    "ema": ema.state_dict(),
+                    "opt": opt.state_dict(),
+                    "train_steps": train_steps,
+                    "epoch": epoch,  # Optionnel si vous voulez sauvegarder l'epoch
+                    "scaler": scaler.state_dict() if scaler is not None else None,
+                    "scheduler": lr_scheduler.state_dict() if lr_scheduler else None # ✅ SAUVEGARDER LE SCHEDULER
+                }
+                # Sauvegarder la config séparément si nécessaire
+                config_dict = OmegaConf.to_container(cfg, resolve=True)  # Convertir en dict standard
+                checkpoint["cfg"] = config_dict  # Dict standard compatible avec weights_only=True
+                checkpoint_path = f"{checkpoint_dir}/epoch_finished_{epoch}_step{train_steps:07d}.pt"
+                torch.save(checkpoint, checkpoint_path)
+                logger.info(f"Saved checkpoint to {checkpoint_path}")
+            dist.barrier()
     # Cleanup
     if hook_handle:
         hook_handle.remove()

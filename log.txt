@@ -1,4 +1,23 @@
-[[34m2025-07-08 21:39:33[0m] ✅ Checkpoint loaded with weights_only=True
-[[34m2025-07-08 21:39:39[0m] ✅ Wandb initialisé - Projet: Sampling SiT, Run: ddp-native-test
-[[34m2025-07-08 22:50:39[0m] ✅ Checkpoint loaded with weights_only=True
-[[34m2025-07-08 22:50:47[0m] ✅ Wandb initialisé - Projet: Sampling SiT, Run: ddp-native-test
+[[34m2025-07-12 19:08:16[0m] ✅ Checkpoint loaded with weights_only=True
+[[34m2025-07-12 19:09:06[0m] ✅ Checkpoint loaded with weights_only=True
+[[34m2025-07-12 19:09:12[0m] ✅ Wandb initialisé - Projet: Sampling SiT, Run: ddp-native-test
+[[34m2025-07-12 19:32:06[0m] ⚠️ Failed to load with weights_only=True: [Errno 2] No such file or directory: '/capstor/scratch/cscs/vbastien/SiT_anchoring/outputs/2025-07-11/01-54-22_SiT-XL/2_Linear_velocity_time_True/checkpoints/101_0510000.ptt'
+[[34m2025-07-12 19:32:06[0m] Falling back to weights_only=False. Ensure checkpoint is trusted.
+[[34m2025-07-12 19:38:12[0m] ✅ Checkpoint loaded with weights_only=True
+[[34m2025-07-12 19:38:18[0m] ✅ Wandb initialisé - Projet: Sampling SiT, Run: ddp-native-test
+[[34m2025-07-12 19:54:17[0m] ✅ Checkpoint loaded with weights_only=True
+[[34m2025-07-12 19:54:23[0m] ✅ Wandb initialisé - Projet: Sampling SiT, Run: ddp-native-test
+[[34m2025-07-12 19:58:29[0m] ✅ Checkpoint loaded with weights_only=True
+[[34m2025-07-12 19:58:34[0m] ✅ Wandb initialisé - Projet: Sampling SiT, Run: ddp-native-test
+[[34m2025-07-12 19:59:45[0m] ✅ Checkpoint loaded with weights_only=True
+[[34m2025-07-12 19:59:51[0m] ✅ Wandb initialisé - Projet: Sampling SiT, Run: ddp-native-test
+[[34m2025-07-12 20:04:20[0m] ✅ Checkpoint loaded with weights_only=True
+[[34m2025-07-12 20:04:26[0m] ✅ Wandb initialisé - Projet: Sampling SiT, Run: ddp-native-test
+[[34m2025-07-12 20:05:32[0m] ✅ Checkpoint loaded with weights_only=True
+[[34m2025-07-12 20:05:38[0m] ✅ Wandb initialisé - Projet: Sampling SiT, Run: ddp-native-test
+[[34m2025-07-12 20:09:05[0m] ✅ Checkpoint loaded with weights_only=True
+[[34m2025-07-12 20:09:10[0m] ✅ Wandb initialisé - Projet: Sampling SiT, Run: ddp-native-test
+[[34m2025-07-12 20:12:04[0m] ✅ Checkpoint loaded with weights_only=True
+[[34m2025-07-12 20:12:10[0m] ✅ Wandb initialisé - Projet: Sampling SiT, Run: ddp-native-test
+[[34m2025-07-13 00:36:14[0m] ✅ Checkpoint loaded with weights_only=True
+[[34m2025-07-13 00:36:20[0m] ✅ Wandb initialisé - Projet: Sampling SiT, Run: ddp-native-test

@@ -3,6 +3,216 @@ import os
 import sys
 import torch
 import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+import seaborn as sns
+import wandb    
+import wandb_utils
+
+
+@torch.no_grad()
+def run_pca_visualization_on_test_set(cfg, ema_model, vae, transport, test_iter, test_loader, train_steps, wandb_initialised, logger, device, same_batch=True):
+    """
+    Run PCA-RGB visualization on test set, using the provided iterator.
+    """
+    logger.info("🎨 Running PCA-RGB visualization on test set...")
+    if same_batch:
+        logger.info("🔄 Using the same batch for PCA visualization")
+    try:
+        if same_batch:
+            test_iter = iter(test_loader)  # Reset iterator to start from the beginning
+        try:
+            viz_x, viz_labels = next(test_iter)
+        except StopIteration:
+            # Reset iterator if exhausted
+            test_iter = iter(test_loader)
+            viz_x, viz_labels = next(test_iter)
+            logger.info("🔄 Test iterator reset - cycling through test set again")
+        
+        viz_x = viz_x.to(device)
+        viz_labels = viz_labels.to(device)
+        
+        # Encode to latents
+        viz_latents = vae.encode(viz_x).latent_dist.sample().mul_(0.18215)
+        
+        # Test different timesteps
+        if cfg.get('use_time', True):
+            t_to_test = cfg.get('pca_t_to_test', [0.01, 0.25, 0.5, 0.75, 0.99])
+        else:
+            t_to_test = [0.5]
+
+        if cfg.get('noise_to_test', [0.01, 0.25, 0.5, 0.75, 0.99]) is not None:
+            noise_to_add = cfg.get('noise_to_test', [0.01, 0.25, 0.5, 0.75, 0.99])
+        else:
+            noise_to_add = [1.]
+            logger.info("🔇 No noise added to PCA")
+        # Log original images for this timestep
+        if cfg.wandb and wandb_initialised:
+            wandb_utils.log({
+                f"test_originals": [wandb.Image(img) for img in viz_x]
+            }, step=train_steps)
+        for i, noise in enumerate(noise_to_add):
+            if noise == 1.:
+                xt = viz_latents.clone()
+            else:
+                viz_noise = torch.full((viz_latents.shape[0],), noise, device=device)
+                _ , x0, x1_current = transport.sample(viz_latents)
+                _, xt, ut = transport.path_sampler.plan(viz_noise, x0, x1_current)
+
+            for j, t_value in enumerate(t_to_test):
+                viz_t = torch.full((viz_latents.shape[0],), t_value, device=device)
+                if logger:
+                    logger.debug(f"xt.shape: {xt.shape}, viz_t.shape: {viz_t.shape}, viz_labels.shape: {viz_labels.shape}")
+                # Get layers to visualize
+                layer_names = cfg.get('pca_layers', [f'blocks.{i}' for i in [3, 6, 12, 18, 24]])
+                num_blocks = len(ema_model.blocks)
+                logger.info(f"🔍 Visualizing PCA for layers: {layer_names} (num_blocks={num_blocks})") 
+                valid_layer_names = [name for name in layer_names if int(name.split('.')[1]) < num_blocks]
+                
+                if not valid_layer_names:
+                    logger.warning("⚠️ No valid layer names for PCA visualization")
+                    continue
+                
+                # Capture activations
+                activations_dict = capture_intermediate_activations(
+                    ema_model, xt, viz_t, viz_labels, 
+                    layer_names=valid_layer_names
+                )
+                
+                if activations_dict:
+                    
+                    # Process each layer
+                    for layer_name, layer_activations in activations_dict.items():
+                        pca_images_np = visualize_pca_as_rgb(
+                            layer_activations
+                        )
+
+                        if pca_images_np:
+                            wandb_images = [
+                                wandb.Image(img, caption=f"Sample {i} - t={t_value:.2f}")
+                                for i, img in enumerate(pca_images_np)
+                            ]
+                            
+                            if cfg.wandb and wandb_initialised:
+                                wandb_utils.log({
+                                    f"pca_visualization_t_{t_value:.2f}_noise_{noise:.2f}/{layer_name}": wandb_images
+                                }, step=train_steps)
+                                
+                    logger.info(f"✅ PCA visualizations logged for timestep {t_value:.2f}")
+                else:
+                    logger.warning(f"⚠️ No activations captured for timestep {t_value:.2f}")
+        
+        logger.info("✅ Test set PCA visualization complete")
+        return test_iter  # ✅ Return the iterator for next use
+        
+    except Exception as e:
+        logger.error(f"❌ PCA visualization failed: {e}")
+        import traceback
+        logger.debug(traceback.format_exc())
+        return test_iter  # Return iterator even on error
+
+
+def visualize_pca_as_rgb(layer_activations: torch.Tensor) -> list:
+    """
+    Transforme les activations d'une couche pour un batch d'images en images RGB via PCA.
+
+    Args:
+        layer_activations (torch.Tensor): Les activations pour une seule couche.
+                                          Shape attendue: (B, N, D).
+
+    Returns:
+        List[np.ndarray]: Une liste d'images RGB (format NumPy), une pour chaque image du batch.
+    """
+    if not isinstance(layer_activations, torch.Tensor) or len(layer_activations.shape) != 3:
+        print(f"❌ Format d'activation invalide pour PCA-RGB. Attendu (B, N, D), reçu {layer_activations.shape}.")
+        return []
+
+    batch_size = layer_activations.shape[0]
+    rgb_images = []
+
+    for i in range(batch_size):
+        try:
+            # Shape: (num_patches, dim)
+            features = layer_activations[i].detach().cpu().numpy()
+
+            # Appliquer PCA pour obtenir les 3 composantes principales
+            pca = PCA(n_components=3)
+            transformed = pca.fit_transform(features)
+
+            # Normaliser chaque composante entre 0 et 1 pour former une image RGB
+            rgb_image_components = np.zeros_like(transformed)
+            for component_idx in range(3):
+                comp = transformed[:, component_idx]
+                min_val, max_val = comp.min(), comp.max()
+                if max_val > min_val:
+                    rgb_image_components[:, component_idx] = (comp - min_val) / (max_val - min_val)
+                # Si max_val == min_val, la composante est déjà 0, donc on ne fait rien.
+
+            # Redimensionner en grille 2D
+            num_patches = features.shape[0]
+            grid_size = int(np.sqrt(num_patches))
+            if grid_size * grid_size != num_patches:
+                print(f"⚠️  Skipping PCA image {i}: {num_patches} patches is not a perfect square.")
+                continue
+
+            rgb_image = rgb_image_components.reshape(grid_size, grid_size, 3)
+            rgb_images.append(rgb_image)
+
+        except Exception as e:
+            print(f"❌ Erreur lors du traitement PCA-RGB pour l'image {i}: {e}")
+            continue
+
+    return rgb_images
+
+def capture_intermediate_activations(model, x, t, y, layer_names=None):
+    """
+    Capture les activations des couches intermédiaires pendant un forward pass
+    
+    Args:
+        model: Le modèle SiT
+        x: Input tensor
+        t: Timesteps
+        y: Labels
+        layer_names: Liste des noms de couches à capturer (ex: ['blocks.4', 'blocks.8'])
+        
+    Returns:
+        Dict[str, torch.Tensor] - Activations capturées
+    """
+
+    activations = {}
+    hooks = []
+
+    # Définir les couches par défaut si non spécifiées
+    if layer_names is None:
+        # Prendre quelques couches représentatives
+        num_blocks = len(model.blocks) if hasattr(model, 'blocks') else 12
+        layer_names = [
+            f'blocks.{i}' for i in range(num_blocks)
+        ]
+    def make_hook(name):
+        def hook_fn(module, input, output):
+            activations[name] = output.clone().detach()
+        return hook_fn
+    
+    # Attacher les hooks
+    try:
+        for layer_name in layer_names:
+            layer = get_layer_by_name(model, layer_name)
+            hook = layer.register_forward_hook(make_hook(layer_name))
+            hooks.append(hook)
+        # Forward pass
+        with torch.no_grad():
+            _ = model(x, t, y)
+
+        return activations
+
+    except Exception as e:
+        print(f"❌ Error in capture_intermediate_activations:")
+        raise
+    finally:
+        # Nettoyer les hooks
+        for hook in hooks:
+            hook.remove()
 
 
 def compute_entropy(x: torch.Tensor, num_bins: int = 512) -> float:
