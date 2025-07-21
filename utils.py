@@ -11,7 +11,7 @@ import wandb_utils
 
 
 @torch.no_grad()
-def run_pca_visualization_on_test_set(cfg, ema_model, vae, transport, test_iter, test_loader, train_steps, wandb_initialised, logger, device, same_batch=True):
+def run_pca_visualization_on_test_set(cfg, ema_model, transport, test_iter, test_loader, train_steps, wandb_initialised, logger, device, same_batch=True):
     """
     Run PCA-RGB visualization on test set, using the provided iterator.
     """

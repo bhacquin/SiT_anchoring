@@ -13,6 +13,7 @@ from pathlib import Path
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -40,7 +41,7 @@ from download import find_model
 from transport import create_transport, Sampler
 from train_utils import init_wandb, get_layer_output_dim, create_scheduler, get_layer_by_name
 from diffusers.models import AutoencoderKL
-from losses import info_nce_loss, dispersive_info_nce_loss
+from losses import dispersive_info_nce_loss, paired_info_nce_loss
 import wandb_utils
 import wandb
 import matplotlib.pyplot as plt
@@ -516,20 +517,21 @@ def main(cfg: DictConfig):
     z_dims = cfg.get('z_dims', [768])
 
     model = SiT_models[cfg.model](
-        input_size=latent_size,
-        num_classes=cfg.num_classes,
-        use_time=cfg.get('use_time', True),  # Use time embeddings if specified
-        encoder_depth=encoder_depth,
-        use_projectors=use_projectors,
-        z_dims=z_dims,
-        learn_sigma=cfg.get('learn_sigma', True)
-    )
+                input_size=latent_size,
+                num_classes=cfg.num_classes,
+                use_time=cfg.get('use_time', True),  # Use time embeddings if specified
+                encoder_depth=encoder_depth,
+                use_projectors=use_projectors,
+                z_dims=z_dims,
+                learn_sigma=cfg.get('learn_sigma', True)
+            )
     
     if logger:
         logger.info(f"Using time as a condition: {cfg.get('use_time', True) }")
     # Note that parameter initialization is done within the SiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     model.to(device)
+    
     if cfg.ckpt is not None:
         ckpt_path = cfg.ckpt
         try:
@@ -565,19 +567,6 @@ def main(cfg: DictConfig):
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=0)
     
-    if getattr(cfg, 'use_mlp_for_pairwise', False):
-        mlp = None
-        # Load checkpoint states if resuming
-        if cfg.ckpt is not None:
-            ckpt_path = cfg.ckpt
-            # Load optimizer state
-            if "mlp" in checkpoint:
-                mlp.load_state_dict(checkpoint["mlp"])
-                if rank == 0:
-                    logger.info("Loaded MLP state from checkpoint")
-    else:
-        mlp = None
-
     # Setup mixed precision
     mixed_precision = getattr(cfg, 'mixed_precision', 'fp32')
     if mixed_precision == "fp16":
@@ -602,45 +591,8 @@ def main(cfg: DictConfig):
     # Setup contrastive loss si activé
     contrastive_loss_fn = None
     activation_feature_dim = None
-    layer_outputs = []
-    hook_handle = None
     use_contrastive_loss = getattr(cfg, 'use_contrastive_loss', False) 
     use_dispersive_loss = getattr(cfg, 'use_dispersive_loss', False)  
-
-    def hook_fn(module, input, output):
-        layer_outputs.append(output)
-    # print("[DEBUG] cfg.use_contrastive_loss", use_contrastive_loss)
-    if use_contrastive_loss or use_dispersive_loss:
-        # Configurer le hook pour capturer les activations
-        target_layer_name = getattr(cfg, 'contrastive_layer', 'blocks.8')  # Couche du milieu par défaut
-        target_layer = get_layer_by_name(model.module, target_layer_name)
-        hook_handle = target_layer.register_forward_hook(hook_fn)
-        
-        # Déterminer automatiquement la dimension des activations
-        if rank == 0:
-            logger.info(f"🔍 Determining activation dimension for layer: {target_layer_name}")
-        
-        activation_feature_dim = get_layer_output_dim(
-            model.module, 
-            target_layer_name, 
-            input_shape=(1, 4, latent_size, latent_size)
-        )
-        
-        if rank == 0:
-            logger.info(f"✅ Detected activation dimension: {activation_feature_dim}")
-        
-        # Configurer la perte contrastive
-        # contrastive_loss_fn = SimpleInfoNCE(
-        #     temperature=getattr(cfg, 'contrastive_temperature', 0.5)
-        # )
-        
-        if rank == 0:
-            logger.info(f"🔥 Contrastive loss enabled on layer: {target_layer_name}")
-            logger.info(f"   - Activation dimension: {activation_feature_dim}")
-            logger.info(f"   - Temperature: {getattr(cfg, 'contrastive_temperature', 0.5)}")
-            logger.info(f"   - Num noisy versions: {getattr(cfg, 'contrastive_num_noisy_versions', 1)}")
-            logger.info(f"   - Include clean as positive: {getattr(cfg, 'contrastive_include_clean', False)}")
-            logger.info(f"   - Contrastive weight: {getattr(cfg, 'contrastive_weight', 0.1)}")
 
     # Load checkpoint states if resuming
     if cfg.ckpt is not None:
@@ -773,7 +725,6 @@ def main(cfg: DictConfig):
     steps_per_epoch = len(loader)
     start_epoch = train_steps // steps_per_epoch
     remaining_steps_in_epoch = train_steps % steps_per_epoch
-
     if rank == 0 and logger:
         logger.info(f"📊 Dataset info:")
         logger.info(f"   - Total samples: {len(dataset):,}")
@@ -813,6 +764,7 @@ def main(cfg: DictConfig):
     # Variables for monitoring/logging purposes:
     log_steps = 0
     running_loss = 0
+    running_total_loss = 0  # ✅ NOUVELLE VARIABLE
     start_time = time()
 
     # Labels to condition the model with (feel free to change):
@@ -872,14 +824,9 @@ def main(cfg: DictConfig):
                     x_clean = vae.encode(x).latent_dist.sample().mul_(0.18215)
                 
                 # ========== PERTE DE DIFFUSION + CAPTURE D'ACTIVATIONS ==========
-                model_kwargs = dict(y=y)
-                
-                # Clear the layer outputs before forward pass
-                layer_outputs.clear()
-                
+                model_kwargs = dict(y=y)                
                 # Déterminer le nombre d'échantillons pour le contrastive
                 k_samples = getattr(cfg, 'contrastive_num_noisy_versions', 1) if use_contrastive_loss else 1
-                # Forward pass avec capture d'activations
                 if use_amp:
                     with autocast(dtype=autocast_dtype):
                         loss_dict = transport.training_losses(
@@ -896,79 +843,65 @@ def main(cfg: DictConfig):
 
                 # ========== PERTE CONTRASTIVE (si activée) ==========
                 contrastive_loss = 0.0
-                if use_contrastive_loss or use_dispersive_loss:
+                dispersive_loss = 0.0
+                extra_loss = 0.0 
+                jepa_activation = getattr(cfg, 'jepa_activation', False)
+                use_extra_loss = getattr(cfg, 'use_extra_loss', False)
+                if jepa_activation:
+                    with torch.no_grad():
+                        t = torch.zeros((x_clean.shape[0],)).to(device) + 0.99
+                        ema_output, ema_zs = ema(x_clean, t, **model_kwargs)
+                    
+                    for k in range(len(activations)):
+                        extra_loss += F.mse_loss(activations[k], ema_zs[k])
 
-                    features = layer_outputs[0]
+                if use_contrastive_loss or use_dispersive_loss:
                     features = activations[0]
                     B_times_k, number_of_patches, internal_dim = features.shape
-                    layer_outputs.clear()
                     batch_size = x_clean.size(0)
 
                 if use_dispersive_loss:
                     if logger and train_steps < 1:
                         logger.info(f"Using dispersive only contrastive loss with {k_samples} samples")
-                    contrastive_loss = dispersive_info_nce_loss(features, temperature = cfg.contrastive_temperature, norm=cfg.use_norm_in_dispersive, logger = logger, use_l2=cfg.use_l2_in_dispersive,)
+                    for i in range(len(activations)):
+                        dispersive_loss += dispersive_info_nce_loss(activations[i], temperature = cfg.contrastive_temperature, norm=cfg.use_norm_in_dispersive, logger = logger, use_l2=cfg.use_l2_in_dispersive,)
                     if logger:
-                        logger.debug(f"dispersive_loss: {contrastive_loss.item():.6f}")
+                        logger.debug(f"dispersive_loss: {dispersive_loss.item():.6f}")
 
-                elif use_contrastive_loss and k_samples > 1: ##TODO Change the way the k samples are handled probably outa batch and sg()
-                    activations = features.view(batch_size, k_samples, number_of_patches, internal_dim) 
-                    if getattr(cfg, 'use_mlp_for_pairwise', False):
-                        activations = mlp(activations)  # Appliquer MLP si configuré B * K * N * dim
-                    # Vérification précoce des activations du modèle
-                    if not torch.isfinite(activations).all():
-                        if logger:
-                            logger.error(f"Non-finite activations from model! NaN count: {torch.isnan(activations).sum()}, Inf count: {torch.isinf(activations).sum()}")
-                            logger.error(f"Activation stats: min={activations.min():.6f}, max={activations.max():.6f}, mean={activations.mean():.6f}")
-                        # Nettoyer les activations
-                        activations = torch.nan_to_num(activations, nan=0.0, posinf=10.0, neginf=-10.0)
-                        # Optionnel: clamper pour éviter des valeurs extrêmes
-                        activations = torch.clamp(activations, -10.0, 10.0)
-                    ## Entropy logging
-                    if getattr(cfg, 'log_entropy', False) and train_steps % cfg.log_entropy_every == 0:
-                        if logger:
-                            logger.debug(f"Calculating entropy for activations of shape {activations.shape}")
-                        entropy_vectors = activations.reshape(-1, activations.shape[-1]*activations.shape[-2])
-                        entropy_mlp = compute_entropy(entropy_vectors)
-                        if logger and rank == 0:
-                            logger.info(f"Entropy (activation): {entropy_mlp:.6f} at step {train_steps}")
-                            log_dict = {"train/entropy_activation": entropy_mlp}
-                            if cfg.wandb and wandb_initialised:
-                                wandb_utils.log(log_dict, step=train_steps)
-
-                    # Debug: vérifier les gradients avant la perte contrastive
-                    if cfg.get('debug_contrastive', False) and train_steps < 2:
-                        if logger:
-                            logger.debug(f"activations: {activations}")
-                            logger.debug(f"activations.requires_grad: {activations.requires_grad}")
-                            logger.debug(f"activations shape: {activations.shape}")
-                            logger.debug(f"batch_size: {batch_size}, k_samples: {k_samples}")
-                            logger.debug(f"activations is_leaf: {activations.is_leaf}")
-                            logger.debug(f"activations.grad_fn: {activations.grad_fn}")
-
-                    # S'assurer que les activations gardent les gradients
-                    if not activations.requires_grad:
-                        print(f"[WARNING] Activations don't require grad! Enabling...")
-                        activations = activations.requires_grad_(True)
-
-                    contrastive_loss, mean_pos_sim, mean_neg_sim = info_nce_loss(activations, temperature = cfg.contrastive_temperature, logger = logger, 
-                                                                sample_weights = None) 
-                    # Debug: vérifier la perte contrastive
-                    if cfg.get('debug_contrastive', False) and train_steps < 2:
-                        if logger:
-                            logger.debug(f"contrastive_loss: {contrastive_loss.item():.6f}")
-                            logger.debug(f"mean_pos_sim: {mean_pos_sim:.6f}, mean_neg_sim: {mean_neg_sim:.6f}")
-                            logger.debug(f"contrastive_loss.requires_grad: {contrastive_loss.requires_grad}")
-                            logger.debug(f"contrastive_loss.grad_fn: {contrastive_loss.grad_fn}")
+                elif use_contrastive_loss and k_samples == 1: ##TODO Change the way the k samples are handled probably outa batch and sg()
+                    mean_pos_sim = 0.0
+                    mean_neg_sim = 0.0
+                    with torch.no_grad():   
+                        t = torch.zeros((x_clean.shape[0],)).to(device) + 1.0
+                        ema_output, ema_zs = ema(x_clean, t, **model_kwargs)
+                    for i in range(len(activations)):
+                        act_batch_size = activations[i].shape[0]
+                        contrastive_loss_one_latent, mean_pos_sim_one_latent, mean_neg_sim_one_latent = paired_info_nce_loss(activations[i].reshape(act_batch_size, -1), ema_zs[i].reshape(act_batch_size, -1), temperature = 0.5)
+                        contrastive_loss += contrastive_loss_one_latent
+                        mean_pos_sim += mean_pos_sim_one_latent
+                        mean_neg_sim += mean_neg_sim_one_latent
                 else:
                     if logger:
                         logger.debug("Skipping contrastive loss computation (not enabled or k_samples=1)")
                         contrastive_loss = 0.0
 
+                ## Entropy logging
+                if getattr(cfg, 'log_entropy', False) and train_steps % cfg.log_entropy_every == 0:
+                    if logger:
+                        logger.debug(f"Calculating entropy for activations of shape {activations[0].shape}")
+                    entropy_vectors = activations[0].reshape(-1, activations[0].shape[-1]*activations[0].shape[-2])
+                    entropy_mlp = compute_entropy(entropy_vectors)
+                    if logger and rank == 0:
+                        logger.info(f"Entropy (activation): {entropy_mlp:.6f} at step {train_steps}")
+                        log_dict = {"train/entropy_activation": entropy_mlp}
+                        if cfg.wandb and wandb_initialised:
+                            wandb_utils.log(log_dict, step=train_steps)
+
                 # ========== COMBINAISON DES PERTES ==========
-                contrastive_weight = getattr(cfg, 'contrastive_weight', 0.1)
-                total_loss = diffusion_loss + contrastive_weight * contrastive_loss
-                            
+                contrastive_weight = getattr(cfg, 'contrastive_weight', 0.5)
+                dispersive_weight = getattr(cfg, 'dispersive_weight', 0.5)
+                total_loss = diffusion_loss + contrastive_weight * contrastive_loss + dispersive_weight * dispersive_loss + extra_loss
+
                 # Vérification finale que total_loss est un scalaire
                 if total_loss.numel() != 1:
                     if rank == 0:
@@ -994,6 +927,7 @@ def main(cfg: DictConfig):
 
                 # ========== LOGGING ==========
                 running_loss += diffusion_loss.item()
+                running_total_loss += total_loss.item()  # ✅ ACCUMULER total_loss
                 log_steps += 1
                 train_steps += 1
 
@@ -1006,44 +940,70 @@ def main(cfg: DictConfig):
                     avg_diffusion_loss = torch.tensor(running_loss / log_steps, device=device)
                     dist.all_reduce(avg_diffusion_loss, op=dist.ReduceOp.SUM)
                     avg_diffusion_loss = avg_diffusion_loss.item() / dist.get_world_size()
+                    # ✅ MOYENNER AUSSI LA PERTE TOTALE SUR TOUS LES PROCESSUS
+                    avg_total_loss = torch.tensor(running_total_loss / log_steps, device=device)
+                    dist.all_reduce(avg_total_loss, op=dist.ReduceOp.SUM)
+                    avg_total_loss = avg_total_loss.item() / dist.get_world_size()
+                    # ✅ MOYENNER LES PERTES CONTRASTIVES ET DISPERSIVES AUSSI
+                    avg_contrastive_loss = None
+                    avg_dispersive_loss = None
+                    avg_extra_loss = None
+                    if isinstance(contrastive_loss, torch.Tensor):
+                        avg_contrastive_loss = torch.tensor(contrastive_loss.item(), device=device)
+                        dist.all_reduce(avg_contrastive_loss, op=dist.ReduceOp.SUM)
+                        avg_contrastive_loss = avg_contrastive_loss.item() / dist.get_world_size()
                     
+                    if isinstance(dispersive_loss, torch.Tensor):
+                        avg_dispersive_loss = torch.tensor(dispersive_loss.item(), device=device)
+                        dist.all_reduce(avg_dispersive_loss, op=dist.ReduceOp.SUM)
+                        avg_dispersive_loss = avg_dispersive_loss.item() / dist.get_world_size()
+                    
+                    if isinstance(extra_loss, torch.Tensor):
+                        avg_extra_loss = torch.tensor(extra_loss.item(), device=device)
+                        dist.all_reduce(avg_extra_loss, op=dist.ReduceOp.SUM)
+                        avg_extra_loss = avg_extra_loss.item() / dist.get_world_size()
+
                     # LOG UNIQUEMENT DEPUIS RANK 0
                     if rank == 0:
                         log_msg = f"(step={train_steps:07d}) Diffusion Loss: {avg_diffusion_loss:.4f}"
-                        log_dict = {"train/diffusion_loss": avg_diffusion_loss, "train/steps_per_sec": steps_per_sec}
+                        log_dict = {"train/diffusion_loss": avg_diffusion_loss, 
+                                    "train/steps_per_sec": steps_per_sec,
+                                    "train/total_loss": avg_total_loss}
                         current_lr = opt.param_groups[0]['lr']
                         log_dict["train/lr"] = current_lr
-                        if isinstance(contrastive_loss, torch.Tensor):
-                            contrastive_val = contrastive_loss.item()
-                            total_val = total_loss.item()
-                            if use_dispersive_loss:
-                                log_msg += f", Dispersive Loss: {contrastive_val:.4f}, Total Loss: {total_val:.4f}"
-                                log_dict.update({
-                                    "train/dispersive_loss": contrastive_val,
-                                    "train/total_loss": total_val})
-                            elif use_contrastive_loss:
-                                log_msg += f", Contrastive Loss: {contrastive_val:.4f}, Total Loss: {total_val:.4f}"
-                                log_dict.update({
-                                    "train/contrastive_loss": contrastive_val,
-                                    "train/total_loss": total_val})
-                            else:
-                                log_msg += f", Extra Loss: {contrastive_val:.4f}, Total Loss: {total_val:.4f}"
-                                log_dict.update({
-                                    "train/extra_loss": contrastive_val,
-                                    "train/total_loss": total_val})
+
+                        if avg_contrastive_loss is not None and use_contrastive_loss:
+                            log_msg += f", Contrastive Loss: {avg_contrastive_loss:.4f}, Total Loss: {avg_total_loss:.4f}"
+                            log_dict.update({
+                                "train/contrastive_loss": avg_contrastive_loss
+                            })
                             if 'mean_pos_sim' in locals():
                                 log_dict.update({
-                                "train/mean_pos_sim": mean_pos_sim,
-                                "train/mean_neg_sim": mean_neg_sim 
+                                    "train/mean_pos_sim": mean_pos_sim,
+                                    "train/mean_neg_sim": mean_neg_sim 
+                                })
+                        
+                        if avg_dispersive_loss is not None and use_dispersive_loss:
+                            log_msg += f", Dispersive Loss: {avg_dispersive_loss:.4f}, Total Loss: {avg_total_loss:.4f}"
+                            log_dict.update({
+                                "train/dispersive_loss": avg_dispersive_loss
                             })
+                        
+                        if avg_extra_loss is not None and use_extra_loss:
+                            log_msg += f", Extra Loss: {avg_extra_loss:.4f}, Total Loss: {avg_total_loss:.4f}"
+                            log_dict.update({
+                                "train/extra_loss": avg_extra_loss
+                            })
+                        
                         log_msg += f", LR: {current_lr:.2e}"
                         logger.info(log_msg)
                         
                         if cfg.wandb and wandb_initialised:
                             wandb_utils.log(log_dict, step=train_steps)
-                    
+                 
                     # Reset monitoring variables:
                     running_loss = 0
+                    running_total_loss = 0
                     log_steps = 0
                     start_time = time()
 
@@ -1117,7 +1077,7 @@ def main(cfg: DictConfig):
                     # ✅ CLEAN PCA VISUALIZATION ON TEST SET
                     if rank == 0 and cfg.get('visualize_pca_rgb', True) and test_iter is not None:
                         test_iter = run_pca_visualization_on_test_set(
-                            cfg, ema, vae, transport, test_iter, test_loader, train_steps, wandb_initialised, logger, device
+                            cfg, ema, transport, test_iter, test_loader, train_steps, wandb_initialised, logger, device
                         )
                    
                     if rank == 0:
@@ -1149,8 +1109,8 @@ def main(cfg: DictConfig):
                 logger.info(f"Saved checkpoint to {checkpoint_path}")
             dist.barrier()
     # Cleanup
-    if hook_handle:
-        hook_handle.remove()
+    # if hook_handle:
+    #     hook_handle.remove()
 
     logger.info("Done!")
     cleanup()

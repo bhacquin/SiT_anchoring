@@ -21,3 +21,24 @@
 [[34m2025-07-12 20:12:10[0m] ✅ Wandb initialisé - Projet: Sampling SiT, Run: ddp-native-test
 [[34m2025-07-13 00:36:14[0m] ✅ Checkpoint loaded with weights_only=True
 [[34m2025-07-13 00:36:20[0m] ✅ Wandb initialisé - Projet: Sampling SiT, Run: ddp-native-test
+[[34m2025-07-16 21:44:11[0m] ✅ Checkpoint loaded with weights_only=True
+[[34m2025-07-16 21:49:30[0m] ✅ Checkpoint loaded with weights_only=True
+[[34m2025-07-16 21:49:32[0m] ✅ Wandb initialisé - Projet: Sampling SiT, Run: ddp-native-test
+[[34m2025-07-16 21:52:21[0m] ✅ Checkpoint loaded with weights_only=True
+[[34m2025-07-16 21:52:24[0m] ✅ Wandb initialisé - Projet: Sampling SiT, Run: ddp-native-test
+[[34m2025-07-16 22:52:52[0m] ✅ Checkpoint loaded with weights_only=True
+[[34m2025-07-16 22:52:55[0m] ✅ Wandb initialisé - Projet: Sampling SiT, Run: ddp-native-test
+[[34m2025-07-16 22:57:28[0m] ✅ Checkpoint loaded with weights_only=True
+[[34m2025-07-16 22:57:30[0m] ✅ Wandb initialisé - Projet: Sampling SiT, Run: ddp-native-test
+[[34m2025-07-16 23:03:51[0m] ✅ Checkpoint loaded with weights_only=True
+[[34m2025-07-16 23:03:53[0m] ✅ Wandb initialisé - Projet: Sampling SiT, Run: ddp-native-test
+[[34m2025-07-17 00:30:14[0m] ✅ Checkpoint loaded with weights_only=True
+[[34m2025-07-17 00:30:16[0m] ✅ Wandb initialisé - Projet: Sampling SiT, Run: ddp-native-test
+[[34m2025-07-17 16:05:24[0m] ✅ Checkpoint loaded with weights_only=True
+[[34m2025-07-17 16:07:39[0m] ✅ Checkpoint loaded with weights_only=True
+[[34m2025-07-17 16:08:56[0m] ✅ Checkpoint loaded with weights_only=True
+[[34m2025-07-17 16:08:59[0m] ✅ Wandb initialisé - Projet: Sampling SiT, Run: ddp-native-test
+[[34m2025-07-17 17:34:25[0m] ✅ Checkpoint loaded with weights_only=True
+[[34m2025-07-17 17:34:28[0m] ✅ Wandb initialisé - Projet: Sampling SiT, Run: ddp-native-test
+[[34m2025-07-17 18:21:20[0m] ✅ Checkpoint loaded with weights_only=True
+[[34m2025-07-17 18:21:23[0m] ✅ Wandb initialisé - Projet: Sampling SiT, Run: ddp-native-test

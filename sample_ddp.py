@@ -139,8 +139,12 @@ def main(mode, args):
     latent_size = args.image_size // 8
     model = SiT_models[args.model](
         input_size=latent_size,
-        num_classes=getattr(cfg, 'num_classes', args.num_classes),
-        use_time=cfg.get('use_time', True)  # Use time embeddings if specified
+        num_classes=cfg.get('num_classes', 1000),
+        use_time=cfg.get('use_time', True),  # Use time embeddings if specified
+        encoder_depth=cfg['encoder_depth'],
+        use_projectors=cfg['use_projectors'],
+        z_dims=cfg['z_dims'],
+        learn_sigma=cfg.get('learn_sigma', True)
     )
     model = model.to(device)
     model.load_state_dict(checkpoint["ema"])
@@ -302,10 +306,10 @@ if __name__ == "__main__":
     assert mode[:2] != "--", "Usage: program.py <mode> [options]"
     assert mode in ["ODE", "SDE"], "Invalid mode. Please choose 'ODE' or 'SDE'"
 
-    parser.add_argument("--model", type=str, choices=list(SiT_models.keys()), default="SiT-XL/2")
+    parser.add_argument("--model", type=str, choices=list(SiT_models.keys()), default="SiT-B/2")
     parser.add_argument("--vae",  type=str, choices=["ema", "mse"], default="ema")
-    parser.add_argument("--sample-dir", type=str, default="Conditional_Dispersive_SiT_256_330k/")
-    parser.add_argument("--per-proc-batch-size", type=int, default=64)
+    parser.add_argument("--sample-dir", type=str, default="Samples/SiT-B/TimeConditioned/Contrastive_256_epoch49/")
+    parser.add_argument("--per-proc-batch-size", type=int, default=256)
     parser.add_argument("--num-fid-samples", type=int, default=50_000)
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
@@ -315,7 +319,7 @@ if __name__ == "__main__":
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--tf32", action=argparse.BooleanOptionalAction, default=True,
                         help="By default, use TF32 matmuls. This massively accelerates sampling on Ampere GPUs.")
-    parser.add_argument("--ckpt", type=str, default="/capstor/scratch/cscs/vbastien/SiT_anchoring/outputs/2025-07-09/22-52-56/checkpoints/0_0330000.pt",
+    parser.add_argument("--ckpt", type=str, default="/capstor/scratch/cscs/vbastien/SiT_anchoring/outputs/SiT-B/2/JEPAlike_False/Time_Cond_True/2025-07-16/Contrast_True__DivFalse_L2_False/checkpoints/epoch_finished_49_step0250200.pt",
                         help="Optional path to a SiT checkpoint (default: auto-download a pre-trained SiT-XL/2 model).")
 
     parse_transport_args(parser)

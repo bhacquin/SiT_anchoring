@@ -175,6 +175,7 @@ class SiT(nn.Module):
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
         self.patch_size = patch_size
         self.num_heads = num_heads
+        self.hidden_size = hidden_size
         self.use_time = use_time
         self.z_dims = z_dims
         self.encoder_depth = encoder_depth
