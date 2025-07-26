@@ -864,9 +864,9 @@ def main(cfg: DictConfig):
                     if logger and train_steps < 1:
                         logger.info(f"Using dispersive only contrastive loss with {k_samples} samples")
                     for i in range(len(activations)):
-                        dispersive_loss += dispersive_info_nce_loss(activations[i], temperature = cfg.contrastive_temperature, norm=cfg.use_norm_in_dispersive, logger = logger, use_l2=cfg.use_l2_in_dispersive,)
+                        dispersive_loss += dispersive_info_nce_loss(activations[i], temperature = cfg.dispersive_temperature, norm=cfg.use_norm_in_dispersive, logger = logger, use_l2=cfg.use_l2_in_dispersive,)
                     if logger:
-                        logger.debug(f"dispersive_loss: {dispersive_loss.item():.6f}")
+                        logger.info(f"dispersive_loss: {dispersive_loss.item():.6f}")
 
                 elif use_contrastive_loss and k_samples == 1: ##TODO Change the way the k samples are handled probably outa batch and sg()
                     mean_pos_sim = 0.0
@@ -885,23 +885,13 @@ def main(cfg: DictConfig):
                         logger.debug("Skipping contrastive loss computation (not enabled or k_samples=1)")
                         contrastive_loss = 0.0
 
-                ## Entropy logging
-                if getattr(cfg, 'log_entropy', False) and train_steps % cfg.log_entropy_every == 0:
-                    if logger:
-                        logger.debug(f"Calculating entropy for activations of shape {activations[0].shape}")
-                    entropy_vectors = activations[0].reshape(-1, activations[0].shape[-1]*activations[0].shape[-2])
-                    entropy_mlp = compute_entropy(entropy_vectors)
-                    if logger and rank == 0:
-                        logger.info(f"Entropy (activation): {entropy_mlp:.6f} at step {train_steps}")
-                        log_dict = {"train/entropy_activation": entropy_mlp}
-                        if cfg.wandb and wandb_initialised:
-                            wandb_utils.log(log_dict, step=train_steps)
-
                 # ========== COMBINAISON DES PERTES ==========
                 contrastive_weight = getattr(cfg, 'contrastive_weight', 0.5)
                 dispersive_weight = getattr(cfg, 'dispersive_weight', 0.5)
                 total_loss = diffusion_loss + contrastive_weight * contrastive_loss + dispersive_weight * dispersive_loss + extra_loss
-
+                if logger:
+                    logger.info(f"diffusion_loss: {diffusion_loss}, contrastive_loss: {contrastive_loss}, dispersive_loss: {dispersive_loss}, extra_loss: {extra_loss}")
+                    logger.info(f"total_loss: {total_loss}")
                 # Vérification finale que total_loss est un scalaire
                 if total_loss.numel() != 1:
                     if rank == 0:
@@ -994,7 +984,24 @@ def main(cfg: DictConfig):
                             log_dict.update({
                                 "train/extra_loss": avg_extra_loss
                             })
-                        
+                        for i in range(len(activations)):
+                            average_norm_per_patch = torch.norm(activations[i], dim=-1).mean().item()
+                            average_norm_per_image = torch.norm(activations[i].reshape(local_batch_size, -1), dim=-1).mean().item()
+                            log_dict.update({f"train/activation{i}_average_": average_norm_per_patch})
+                            log_msg += f", Activation{i} norm: {average_norm_per_patch}"
+                            log_dict.update({f"train/activation{i}_average_norm_per_image": average_norm_per_image})
+                            log_msg += f", Activation{i} norm per image: {average_norm_per_image:.4f}"
+                        ## Entropy logging
+                        if getattr(cfg, 'log_entropy', True) and train_steps % getattr(cfg, 'log_entropy_every', 1000) == 0:
+                            for i in range(len(activations)):
+                                if logger:
+                                    logger.info(f"Calculating entropy for activations of shape {activations[i].shape}")
+                                entropy_vectors = activations[i].reshape(-1, activations[i].shape[-1]*activations[i].shape[-2])
+                                entropy_mlp = compute_entropy(entropy_vectors)
+                                if logger and rank == 0:
+                                    logger.info(f"Entropy (activation{i}): {entropy_mlp:.6f} at step {train_steps}")
+                                    log_dict.update({f"train/entropy_activation{i}": entropy_mlp})
+
                         log_msg += f", LR: {current_lr:.2e}"
                         logger.info(log_msg)
                         
@@ -1077,7 +1084,7 @@ def main(cfg: DictConfig):
                     # ✅ CLEAN PCA VISUALIZATION ON TEST SET
                     if rank == 0 and cfg.get('visualize_pca_rgb', True) and test_iter is not None:
                         test_iter = run_pca_visualization_on_test_set(
-                            cfg, ema, transport, test_iter, test_loader, train_steps, wandb_initialised, logger, device
+                            cfg, ema, vae, transport, test_iter, test_loader, train_steps, wandb_initialised, logger, device
                         )
                    
                     if rank == 0:

@@ -4,18 +4,20 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from torchvision.datasets import VOCSegmentation
-
+import logging
+from tqdm import tqdm
 import numpy as np
 from PIL import Image
 import argparse
-from tqdm import tqdm
 import os
 from datasets import load_dataset
 from models import SiT_models
 from diffusers import AutoencoderKL
-from utils import run_pca_visualization_on_test_set
+from utils import run_pca_visualization_on_test_set, visualize_pca_as_rgb, capture_intermediate_activations
 from train_utils import init_wandb
 from transport import create_transport
+from omegaconf import OmegaConf
+import wandb
 
 try:
     from torchmetrics import JaccardIndex
@@ -23,6 +25,45 @@ except ImportError:
     print("Avertissement : torchmetrics n'est pas installé. Le mIoU ne sera pas calculé.")
     print("Veuillez l'installer avec : pip install torchmetrics")
     JaccardIndex = None
+
+
+class LinearSegmentationProbe(nn.Module):
+    """
+    Linear probe simple pour la segmentation.
+    Juste une projection linéaire : features → logits de segmentation.
+    """
+    def __init__(self, in_channels, num_classes = 21, target_size=256):
+        super().__init__()
+        self.target_size = target_size
+        self.num_classes = num_classes
+        # ✅ Juste une projection linéaire
+        self.linear_probe = nn.Linear(in_channels, num_classes)
+        
+    def forward(self, features):
+        B, N, C = features.shape  # [B, 256, 768]
+        
+        # ✅ Projection linéaire directe : [B, N, C] → [B, N, num_classes]
+        logits = self.linear_probe(features)  # [B, 256, 21]
+        
+        # ✅ Calculer la taille spatiale des patches
+        patches_per_side = int(np.sqrt(N))  # √256 = 16
+        
+        # ✅ Reshape en format image : [B, num_classes, H, W]
+        logits = logits.permute(0, 2, 1).reshape(B, self.num_classes, patches_per_side, patches_per_side)
+        # Résultat : [B, 21, 16, 16]
+        
+        # ✅ Upsampling simple vers la taille cible
+        if patches_per_side != self.target_size:
+            logits = F.interpolate(
+                logits, 
+                size=(self.target_size, self.target_size),
+                mode='bilinear', 
+                align_corners=False
+            )
+        # Résultat final : [B, 21, 256, 256]
+        
+        return logits
+
 
 class PatchToPixelSegmentationHead(nn.Module):
     """
@@ -180,7 +221,7 @@ def main(args):
         transforms.Resize((args.image_size, args.image_size), interpolation=Image.NEAREST),
         transforms.Lambda(lambda x: torch.as_tensor(np.array(x), dtype=torch.long))
     ])
-
+    logger = logging.getLogger(__name__)
     # Vérifier si les données sont complètement extraites
     voc_path = os.path.join(args.data_path, "VOCdevkit", "VOC2012")
     annotations_path = os.path.join(voc_path, "Annotations")
@@ -241,7 +282,7 @@ def main(args):
             print(f"Erreur lors du chargement du checkpoint avec weights_only=True : {e}")
             checkpoint = torch.load(ckpt_path, weights_only=False, map_location='cpu')
         
-        cfg = checkpoint["cfg"]  # Load the config from the checkpoint
+        cfg = OmegaConf.create(checkpoint["cfg"])
     print(f"Loading SiT model '{args.model}'...")
     latent_size = args.image_size // 8
     sit_model = SiT_models[args.model](
@@ -253,7 +294,7 @@ def main(args):
         z_dims=cfg['z_dims'],
         learn_sigma=cfg.get('learn_sigma', True)
     )
-    wandb_initialised = init_wandb(cfg, 0, None)
+    wandb_initialised = init_wandb(cfg, 0, logger)
     transport = create_transport(
         cfg['path_type'],
         cfg['prediction'],
@@ -295,120 +336,226 @@ def main(args):
         # Calculer le facteur d'upsampling correct
         correct_upsample_factor = args.image_size // activation_size
         print(f"Facteur d'upsampling correct : {correct_upsample_factor}")
-    # Création de la tête de segmentation
+
+    # ✅ Déterminer les couches disponibles
+    num_blocks = len(sit_model.blocks)
+    layer_names = [f'blocks.{i}' for i in range(num_blocks)]
+    print(f"✅ {len(layer_names)} couches détectées: {layer_names}")
+    
+    # ✅ Créer une liste de têtes de segmentation
     feature_dim = sit_model.hidden_size
-    # seg_head = SegmentationHead(
+    seg_heads = nn.ModuleList([
+        LinearSegmentationProbe(
+            in_channels=feature_dim, 
+            num_classes=num_classes, 
+            target_size=args.image_size
+        ) for _ in range(len(layer_names))
+    ]).to(device)
+
+    # seg_head = LinearSegmentationProbe(
     #     in_channels=feature_dim, 
     #     num_classes=num_classes, 
-    #     target_size=args.image_size,
-    #     activation_size=activation_size  # Utiliser la taille détectée
+    #     target_size=args.image_size
     # ).to(device)
-    seg_head = PatchToPixelSegmentationHead(
-        in_channels=feature_dim, 
-        num_classes=num_classes, 
-        patch_pixel_size=16  # Chaque patch devient 16×16 pixels
-    ).to(device)
     # Optimiseur
-    optimizer = torch.optim.AdamW(seg_head.parameters(), lr=args.lr, weight_decay=1e-4)
-    criterion = nn.CrossEntropyLoss(ignore_index=255)  # Ignorer l'étiquette de bordure de PASCAL
-
-    if JaccardIndex:
-        metric = JaccardIndex(task="multiclass", num_classes=num_classes, ignore_index=255).to(device)
-  
-
+    # ✅ Créer une liste d'optimiseurs
+    optimizers = [
+        torch.optim.AdamW(seg_head.parameters(), lr=args.lr, weight_decay=1e-4)
+        for seg_head in seg_heads
+    ]
     
-    best_miou = 0.0
-    for epoch in range(args.epochs):
-        seg_head.train()
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Training]")
-        # ✅ Adapter la boucle pour gérer le format de sortie de Hugging Face
-        for images, targets in pbar:
-            images, targets = images.to(device), targets.to(device)
-                        # ✅ Étape A: Encoder les images en latents avec le VAE
-            with torch.no_grad():
-                # Le VAE attend des images normalisées entre -1 et 1, ce que fait déjà votre transform.
-                latent_dist = vae.encode(images).latent_dist
-                latents = latent_dist.sample()
-                # Facteur de mise à l'échelle standard pour les latents de ce VAE
-                latents = latents * 0.18215
-            # Simuler les entrées nécessaires pour le SiT
-            # ✅ Utiliser des valeurs fixes pour t et y pour une extraction de caractéristiques cohérente
-            t = torch.full((images.size(0),), 0.999, device=device) # t proche de 1 (côté données)
-            y = torch.full((images.size(0),), 1000, dtype=torch.long, device=device) # Classe non conditionnelle
-            # latents = F.interpolate(images, size=(latent_size, latent_size))
-            # ✅ Étape 1: Obtenir les activations du SiT gelé (pas de calcul de gradient ici)
-            with torch.no_grad():
-                _, activations = sit_model(latents, t, y=y)
-                # Sélectionner les caractéristiques de la couche spécifiée
-                features = activations[0]
-            print(f"Shape des features : {features.shape}")  # Debugging
-            optimizer.zero_grad()
-            masks_pred = seg_head(features)
-            loss = criterion(masks_pred, targets)
-            
-            loss.backward()
-            optimizer.step()
-            pbar.set_postfix(loss=loss.item())
+    # ✅ Créer une liste de métriques
+    if JaccardIndex:
+        metrics = [
+            JaccardIndex(task="multiclass", num_classes=num_classes, ignore_index=255).to(device)
+            for _ in range(len(layer_names))
+        ]
+    else:
+        metrics = [None] * len(layer_names)
+    
+    criterion = nn.CrossEntropyLoss(ignore_index=255)
+    
+    # ✅ Tracking des résultats
+    best_mious = [0.0] * len(layer_names)
+    
+    print(f"✅ {len(seg_heads)} têtes de segmentation créées")
 
-        # Boucle de validation
-        seg_head.eval()
-        if JaccardIndex:
-            metric.reset()
-        with torch.no_grad():
-            pbar_val = tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Validation]")
-            for i, (images, targets) in enumerate(pbar_val):
+    for epoch in range(args.epochs):
+        for seg_head in seg_heads:
+            seg_head.train()
+            pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Training]")
+            # ✅ Adapter la boucle pour gérer le format de sortie de Hugging Face
+            for images, targets in pbar:
                 images, targets = images.to(device), targets.to(device)
-                latent_dist = vae.encode(images).latent_dist
-                latents = latent_dist.sample()
-                latents = latents * 0.18215
+                with torch.no_grad():
+                    latent_dist = vae.encode(images).latent_dist
+                    latents = latent_dist.sample()
+                    latents = latents * 0.18215
                 # ✅ Utiliser des valeurs fixes pour t et y pour une extraction de caractéristiques cohérente
                 t = torch.full((images.size(0),), 0.999, device=device) # t proche de 1 (côté données)
                 y = torch.full((images.size(0),), 1000, dtype=torch.long, device=device) # Classe non conditionnelle
 
-                # latents = F.interpolate(images, size=(latent_size, latent_size))
+                # layer_names = cfg.get('pca_layers', [f'blocks.{i}' for i in [3, 6, 12, 18, 24]])
+                # num_blocks = len(sit_model.blocks)
+                # valid_layer_names = [name for name in layer_names if int(name.split('.')[1]) < num_blocks]
+                if not layer_names:
+                    logger.warning("⚠️ No valid layer names for PCA visualization")
+                    continue
 
-                _, activations = sit_model(latents, t, y=y)
+                activations_dict = capture_intermediate_activations(
+                    sit_model, latents, t, y, 
+                    layer_names=layer_names)
+            losses = []
+            for i, layer_name in enumerate(layer_names):
+                if layer_name in activations_dict:
+                    features = activations_dict[layer_name]
+                    
+                    optimizers[i].zero_grad()
+                    masks_pred = seg_heads[i](features)
+                    loss = criterion(masks_pred, targets)
+                    loss.backward()
+                    optimizers[i].step()
+                    
+                    losses.append(loss.item())
+                else:
+                    losses.append(0.0)
+            
+            # ✅ Afficher la loss moyenne
+            avg_loss = np.mean(losses) if losses else 0.0
+            pbar.set_postfix(avg_loss=f"{avg_loss:.4f}")
 
-                features = activations[0]
-                run_pca_visualization_on_test_set(
-                            cfg, sit_model, transport, i, train_loader, i, wandb_initialised, None, device
-                        )
-                masks_pred = seg_head(features)
+        # ✅ Validation loop pour toutes les têtes
+        for seg_head in seg_heads:
+            seg_head.eval()
+        
+        if JaccardIndex:
+            for metric in metrics:
+                if metric is not None:
+                    metric.reset()
+        with torch.no_grad():
+            pbar_val = tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.epochs} [Validation All Layers]")
+            
+            for images, targets in pbar_val:
+                images, targets = images.to(device), targets.to(device)
                 
-                if JaccardIndex:
-                    metric.update(masks_pred.argmax(dim=1), targets)
+                latent_dist = vae.encode(images).latent_dist
+                latents = latent_dist.sample() * 0.18215
+                
+                t = torch.full((images.size(0),), 0.999, device=device)
+                y = torch.full((images.size(0),), 1000, dtype=torch.long, device=device)
+                
+                # ✅ Extraire toutes les activations
+                activations_dict = capture_intermediate_activations(
+                    sit_model, latents, t, y, 
+                    layer_names=layer_names
+                )
+                
+                # ✅ Évaluer chaque tête
+                for i, layer_name in enumerate(layer_names):
+                    if layer_name in activations_dict:
+                        features = activations_dict[layer_name]
+                        masks_pred = seg_heads[i](features)
+                        
+                        if metrics[i] is not None:
+                            metrics[i].update(masks_pred.argmax(dim=1), targets)
+        # ✅ Calculer et afficher les résultats
+        print(f"\n📊 Epoch {epoch+1} Results:")
+        print("-" * 50)
 
         if JaccardIndex:
-            miou = metric.compute().item()
-            print(f"Epoch {epoch+1} | Validation mIoU: {miou:.4f}")
-            if miou > best_miou:
-                best_miou = miou
-                print(f"✨ Nouveau meilleur mIoU ! Sauvegarde du modèle...")
-                torch.save(seg_head.state_dict(), f"segmentation_head_best_layer_{cfg['encoder_depth']}.pt")
+            for i, layer_name in enumerate(layer_names):
+                if metrics[i] is not None:
+                    miou = metrics[i].compute().item()
+                    layer_idx = int(layer_name.split('.')[1])
+                    print(f"Layer {layer_idx:2d}: mIoU = {miou:.4f}")
+                    
+                    # ✅ Sauvegarder le meilleur modèle pour chaque couche
+                    if miou > best_mious[i]:
+                        best_mious[i] = miou
+                        torch.save(
+                            seg_heads[i].state_dict(), 
+                            f"seg_head_layer_{layer_idx:02d}_best.pt"
+                        )
+                    
+                    # ✅ Logger sur wandb
+                    if wandb_initialised:
+                        try:
+                            wandb.log({
+                                f"val_miou/layer_{layer_idx:02d}": miou,
+                                "epoch": epoch
+                            })
+                        except:
+                            pass
+      
+        # ✅ Identifier la meilleure couche
+        if JaccardIndex and best_mious:
+            best_layer_idx = np.argmax(best_mious)
+            best_miou = best_mious[best_layer_idx]
+            print(f"\n🏆 Best layer so far: {best_layer_idx} (mIoU: {best_miou:.4f})")
+            
+            if wandb_initialised:
+                try:
+                    wandb.log({
+                        "best_layer": best_layer_idx,
+                        "best_miou": best_miou,
+                        "epoch": epoch
+                    })
+                except:
+                    pass
 
-    print(f"\nÉvaluation terminée. Meilleur mIoU obtenu : {best_miou:.4f}")
+    # ✅ Résumé final
+    print(f"\n🎯 Final Results:")
+    print("=" * 60)
+    for i, layer_name in enumerate(layer_names):
+        layer_idx = int(layer_name.split('.')[1])
+        print(f"Layer {layer_idx:2d}: Best mIoU = {best_mious[i]:.4f}")
+    
+    if best_mious:
+        overall_best_idx = np.argmax(best_mious)
+        overall_best_miou = best_mious[overall_best_idx]
+        print(f"\n🏆 Overall best: Layer {overall_best_idx} with mIoU = {overall_best_miou:.4f}")
 
-  
+                # features = activations_dict['blocks.9']
+                # if i % 100 == 0 and args.log_map:
+                #     for feature_name, feature_tensor in activations_dict.items():
+                #         pca_images_np = visualize_pca_as_rgb(feature_tensor)
+                #         wandb_images = [wandb.Image(img, caption=f"Sample {i} - t {t[0].item():.2f}")
+                #                         for i, img in enumerate(pca_images_np)
+                #                     ]  
+                #         wandb.log({f"features_{feature_name}_visualization_t_{t[0].item():.2f}": wandb_images
+                #                         , "eval_step": i})
 
+                #     run_pca_visualization_on_test_set(
+                #                 cfg, sit_model, vae, transport, i, train_loader, i, wandb_initialised, logger, device
+                #             )
+            
+                # masks_pred = seg_head(features)
+                # if JaccardIndex:
+                #     metric.update(masks_pred.argmax(dim=1), targets)
+
+    #     if JaccardIndex:
+    #         miou = metric.compute().item()
+    #         print(f"Epoch {epoch+1} | Validation mIoU: {miou:.4f}")
+    #         if miou > best_miou:
+    #             best_miou = miou
+    #             print(f"✨ Nouveau meilleur mIoU ! Sauvegarde du modèle...")
+    #             torch.save(seg_head.state_dict(), f"segmentation_head_best_layer_{cfg['encoder_depth']}.pt")
+
+    # print(f"\nÉvaluation terminée. Meilleur mIoU obtenu : {best_miou:.4f}")
 
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Évaluation des caractéristiques SiT sur PASCAL VOC.")
     parser.add_argument("--model", type=str, default="SiT-B/2", help="Architecture du modèle SiT.")
-    parser.add_argument("--ckpt", type=str, required=False, default="/capstor/scratch/cscs/vbastien/SiT_anchoring/outputs/SiT-B/2/JEPA_True/Time_Cond_True/2025-07-19/Contrast_False__DivFalse_L2_False/checkpoints/epoch_finished_104_step0525420.pt", help="Chemin vers le checkpoint SiT pré-entraîné (.pt).")
+    parser.add_argument("--ckpt", type=str, required=False, default="/capstor/scratch/cscs/vbastien/SiT_anchoring/outputs/SiT-B/2/JEPA_True/Time_Cond_True/2025-07-19/Contrast_False__DivFalse_L2_False/checkpoints/epoch_finished_91_step0460368.pt", help="Chemin vers le checkpoint du modèle SiT pré-entraîné.")
     parser.add_argument("--data-path", type=str, default="./data", help="Chemin pour stocker le jeu de données PASCAL VOC.")
     parser.add_argument("--image-size", type=int, default=256, help="Taille de l'image sur laquelle le SiT a été entraîné.")
     # parser.add_argument("--layer-index", type=int, required=True, help="Index de la couche du Transformer à sonder.")
-    parser.add_argument("--epochs", type=int, default=50, help="Nombre d'époques pour entraîner la tête de segmentation.")
-    parser.add_argument("--batch-size", type=int, default=32, help="Taille du lot.")
+    parser.add_argument("--epochs", type=int, default=15, help="Nombre d'époques pour entraîner la tête de segmentation.")
+    parser.add_argument("--batch-size", type=int, default=64, help="Taille du lot.")
     parser.add_argument("--lr", type=float, default=1e-3, help="Taux d'apprentissage pour l'optimiseur.")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    
+    parser.add_argument("--log-map", action="store_true", help="Activer la journalisation des cartes de caractéristiques.")
     args = parser.parse_args()
     main(args)
-
-### Comment utiliser ce script :
-
-
-

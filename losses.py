@@ -110,54 +110,50 @@ def dispersive_info_nce_loss(vecs: torch.Tensor, norm: Optional[bool] = True, te
     Returns:
         torch.Tensor: Perte dispersive (scalaire)
     """
-    # Gérer les dimensions d'entrée flexibles
     if vecs.ndim == 4:
         B, V, P, D = vecs.shape
-        vecs = vecs.reshape(B * V, P * D)  # Aplatir vers (N, feature_dim)
+        vecs = vecs.reshape(B * V, P * D)
     elif vecs.ndim == 3:
-        vecs = vecs.reshape(vecs.shape[0], -1)  # Aplatir vers (N, feature_dim)
-    elif vecs.ndim != 2:
-        err_msg = f"L'entrée 'vecs' doit être 2D, 3D ou 4D, mais a obtenu {vecs.ndim}D de forme {vecs.shape}."
-        if logger: 
-            logger.error(err_msg)
-        return torch.tensor(0.0, device=vecs.device, dtype=vecs.dtype)
+        B, N, C = vecs.shape
+        vecs = vecs.reshape(B, N * C)  # Needs to be per image 
+    else:
+        raise NotImplementedError(f"Unsupported shape: {vecs.shape}")
     
     N, feature_dim = vecs.shape
     
     if N < 2:
         if logger:
-            logger.warning(f"Perte dispersive : Besoin d'au moins 2 échantillons, obtenu {N}.")
+            logger.warning(f"Besoin d'au moins 2 patches, obtenu {N}.")
         return torch.tensor(0.0, device=vecs.device, dtype=vecs.dtype)
     
-    # Normalisation optionnelle
-
-    
     if use_l2:
-        if norm:
-            vecs = F.normalize(vecs, dim=-1)
-        # Distance L2 : plus c'est grand, plus c'est différent
-        # On veut maximiser les distances, donc minimiser leur négatif
-        distances = torch.cdist(vecs, vecs, p=2)  # (N, N)
-        # print(f"Distances : {distances}, distance maximale {distances.max()}, distance minimale {distances.min()}")
-        # squared_distances = distances ** 2 # (N, N)
-        
-        # squared_distances = torch.clamp(squared_distances, min=0, max=100)  # Éviter les valeurs nulles
-        similarities = distances
-        similarities = torch.clamp(similarities,max=100,min=-100)
-        print(f"Distances au carré : {similarities}, distance au carré maximale {similarities.max()}, distance au carré minimale {similarities.min()}")
-        
+        # z = vecs
+        #     # def disp_loss(self, z): # Dispersive Loss implementation (InfoNCE-L2 variant)
+        # z = z.reshape((z.shape[0],-1)) # flatten
+        # # diff = torch.nn.functional.pdist(z).pow(2)/z.shape[1] # pairwise distance
+        # diff = torch.nn.functional.cdist(z,z).pow(2)/z.shape[1]
+        # # diff = torch.concat((diff, diff, torch.zeros(z.shape[0]).to(vecs.device)))  # match JAX implementation of full BxB matrix
+        # print(f"🔍 diff result: {diff.mean().item():.6f}")
+        # return torch.log(torch.exp(-diff).mean()) # calculate loss
+        distances_condensed = torch.nn.functional.pdist(vecs, p=2).pow(2) / vecs.shape[1]  # Pairwise distance
+        N = vecs.shape[0]
+        distances_matrix = torch.zeros(N, N, device=vecs.device)
+        triu_indices = torch.triu_indices(N, N, offset=1, device=vecs.device)
+        distances_matrix[triu_indices[0], triu_indices[1]] = distances_condensed
+        distances_matrix = distances_matrix + distances_matrix.T  # Symétrique
+        # print(f"🔍 distances_matrix result: {distances_matrix.mean().item():.6f}")
+        logsum = torch.logsumexp(-distances_matrix / temperature, dim=0)
+        log_mean_exp = logsum - torch.log(torch.tensor(len(distances_matrix), dtype=torch.float, device=vecs.device))
+        return log_mean_exp.mean()
+        # Maintenant distances_matrix est (N, N) avec diagonale = 0
     else:
-        # Similarité cosinus : plus c'est grand, plus c'est similaire
-        # On veut minimiser les similarités
         vecs = F.normalize(vecs, dim=-1)
         similarities = -torch.matmul(vecs, vecs.T)  # (N, N)
-    # exp_similarities = torch.exp(-similarities.view(-1) / temperature)
-    # print(f"Similarités exponentielles : {exp_similarities}, similarité maximale {exp_similarities.max()}, similarité minimale {exp_similarities.min()}")
-    # mean_exp_similarities = exp_similarities.mean()
-    # print(f"Similarité moyenne exponentielle : {mean_exp_similarities}") 
-    # loss = torch.log(mean_exp_similarities + 1e-8)  
-    logsum = torch.logsumexp(-similarities.view(-1) / temperature, dim=0)
-    # print(f"Log-somme des exponentielles : {logsum}")
-    return logsum
+        similarities.fill_diagonal_(-1)
+    mean_exp = torch.exp(-similarities / temperature).mean()
+    log_mean_exp = torch.log(mean_exp)
+    # logsum = torch.logsumexp(-similarities / temperature, dim=0)
+    print(f"🔍 log_mean_exp result: {log_mean_exp.item():.6f}")
+    return log_mean_exp
 
 

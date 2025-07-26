@@ -230,8 +230,8 @@ def init_wandb(cfg, rank, logger = None):
         resume_id = getattr(cfg, 'wandb_resume_id', None)
         resume_name = getattr(cfg, 'wandb_resume_name', None)
 
-        if hasattr(cfg, "wandb_api_key") and cfg.wandb_api_key and cfg.wandb_api_key != "<TON_API_KEY_WANDB>":
-            os.environ["WANDB_API_KEY"] = cfg.wandb_api_key
+        if hasattr(cfg, "wandb_api_key") and cfg['wandb_api_key'] and cfg['wandb_api_key'] != "<TON_API_KEY_WANDB>":
+            os.environ["WANDB_API_KEY"] = cfg['wandb_api_key']
         else:
             print(f"⚠️ No Wandb API key found during initialization.")
         

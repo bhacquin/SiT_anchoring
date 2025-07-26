@@ -11,7 +11,7 @@ import wandb_utils
 
 
 @torch.no_grad()
-def run_pca_visualization_on_test_set(cfg, ema_model, transport, test_iter, test_loader, train_steps, wandb_initialised, logger, device, same_batch=True):
+def run_pca_visualization_on_test_set(cfg, ema_model, vae, transport, test_iter, test_loader, train_steps, wandb_initialised, logger, device, same_batch=True):
     """
     Run PCA-RGB visualization on test set, using the provided iterator.
     """
@@ -28,7 +28,7 @@ def run_pca_visualization_on_test_set(cfg, ema_model, transport, test_iter, test
             test_iter = iter(test_loader)
             viz_x, viz_labels = next(test_iter)
             logger.info("🔄 Test iterator reset - cycling through test set again")
-        
+            logger.info(f"viz_x.shape: {viz_x.shape}, viz_labels.shape: {viz_labels.shape}")
         viz_x = viz_x.to(device)
         viz_labels = viz_labels.to(device)
         
@@ -48,9 +48,14 @@ def run_pca_visualization_on_test_set(cfg, ema_model, transport, test_iter, test
             logger.info("🔇 No noise added to PCA")
         # Log original images for this timestep
         if cfg.wandb and wandb_initialised:
-            wandb_utils.log({
-                f"test_originals": [wandb.Image(img) for img in viz_x]
-            }, step=train_steps)
+            try:
+                wandb_utils.log({
+                    f"test_originals": [wandb.Image(img) for img in viz_x]
+                }, step=train_steps)
+            except:
+                wandb.log({
+                    f"test_originals": [wandb.Image(img) for img in viz_x]
+                , "train_step": train_steps})
         for i, noise in enumerate(noise_to_add):
             if noise == 1.:
                 xt = viz_latents.clone()
@@ -74,6 +79,9 @@ def run_pca_visualization_on_test_set(cfg, ema_model, transport, test_iter, test
                     continue
                 
                 # Capture activations
+                if len(viz_labels.shape) > 1:
+                    viz_labels = torch.full((xt.size(0),), 1000, dtype=torch.long, device=device) # Classe non conditionnelle
+                # print(f"xt.shape: {xt.shape}, viz_t.shape: {viz_t.shape}, viz_labels.shape: {viz_labels.shape}")
                 activations_dict = capture_intermediate_activations(
                     ema_model, xt, viz_t, viz_labels, 
                     layer_names=valid_layer_names
@@ -91,12 +99,19 @@ def run_pca_visualization_on_test_set(cfg, ema_model, transport, test_iter, test
                             wandb_images = [
                                 wandb.Image(img, caption=f"Sample {i} - t={t_value:.2f}")
                                 for i, img in enumerate(pca_images_np)
-                            ]
-                            
+                            ]  
                             if cfg.wandb and wandb_initialised:
-                                wandb_utils.log({
-                                    f"pca_visualization_t_{t_value:.2f}_noise_{noise:.2f}/{layer_name}": wandb_images
-                                }, step=train_steps)
+                                try:
+                                    wandb_utils.log({
+                                        f"pca_visualization_t_{t_value:.2f}_noise_{noise:.2f}/{layer_name}": wandb_images
+                                    }, step=train_steps)
+                                except:
+                                    wandb.log({
+                                        f"pca_visualization_t_{t_value:.2f}_noise_{noise:.2f}/{layer_name}": wandb_images
+                                    , "train_step": train_steps})
+                                # wandb_utils.log({
+                                #     f"pca_visualization_t_{t_value:.2f}_noise_{noise:.2f}/{layer_name}": wandb_images
+                                # }, step=train_steps)
                                 
                     logger.info(f"✅ PCA visualizations logged for timestep {t_value:.2f}")
                 else:
