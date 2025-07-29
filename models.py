@@ -8,6 +8,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F  
 import numpy as np
 import math
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
@@ -24,6 +25,40 @@ def build_mlp(hidden_size, projector_dim, z_dim):
                 nn.SiLU(),
                 nn.Linear(projector_dim, z_dim),
             )
+
+# ✅ ADD CUSTOM FLEXIBLE PATCH EMBED
+class FlexiblePatchEmbed(nn.Module):
+    """
+    Flexible 2D Image to Patch Embedding that can handle variable input sizes.
+    Based on timm's PatchEmbed but without strict size checking.
+    """
+    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768, norm_layer=None, flatten=True, bias=True):
+        super().__init__()
+        self.patch_size = (patch_size, patch_size) if isinstance(patch_size, int) else patch_size
+        self.flatten = flatten
+        
+        # Calculate num_patches based on img_size (this is just for reference)
+        img_size = (img_size, img_size) if isinstance(img_size, int) else img_size
+        self.img_size = img_size
+        self.grid_size = (img_size[0] // patch_size, img_size[1] // patch_size)
+        self.num_patches = self.grid_size[0] * self.grid_size[1]
+
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size, bias=bias)
+        self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
+
+    def forward(self, x):
+        # ✅ NO SIZE CHECKING - accept any size that's divisible by patch_size
+        B, C, H, W = x.shape
+        
+        # Optional: Check if divisible by patch_size
+        if H % self.patch_size[0] != 0 or W % self.patch_size[1] != 0:
+            raise ValueError(f"Input size ({H}, {W}) is not divisible by patch_size {self.patch_size}")
+        
+        x = self.proj(x)  # (B, embed_dim, H//patch_size, W//patch_size)
+        if self.flatten:
+            x = x.flatten(2).transpose(1, 2)  # (B, num_patches, embed_dim)
+        x = self.norm(x)
+        return x
 
 #################################################################################
 #               Embedding Layers for Timesteps and Class Labels                 #
@@ -168,8 +203,11 @@ class SiT(nn.Module):
         use_projectors=[],
         z_dims=[],
         use_time=True, 
+        is_teacher=False,
+        use_cls_token=False,
     ):
         super().__init__()
+        self.is_teacher = is_teacher
         self.learn_sigma = learn_sigma
         self.in_channels = in_channels
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
@@ -180,21 +218,38 @@ class SiT(nn.Module):
         self.z_dims = z_dims
         self.encoder_depth = encoder_depth
         self.use_projectors = use_projectors
+        self.use_cls_token = use_cls_token
+
+        self.capturing = False
+        self.captured_activations = {}
+        self.capture_layers = []
 
         # ✅ Validate that lists have the same length
         if len(encoder_depth) != len(use_projectors):
             raise ValueError(f"encoder_depth ({len(encoder_depth)}) and use_projectors ({len(use_projectors)}) must have the same length")
         # ✅ Create a mapping from encoder depth to projector index
         self.depth_to_projector = {depth: idx for idx, depth in enumerate(self.encoder_depth)}
-        self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
+        # self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
+        self.x_embedder = FlexiblePatchEmbed(
+            img_size=input_size, 
+            patch_size=patch_size, 
+            in_chans=in_channels, 
+            embed_dim=hidden_size, 
+            bias=True
+        )
         if self.use_time:
             self.t_embedder = TimestepEmbedder(hidden_size)
         else:
             self.t_embedder = None
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+
         num_patches = self.x_embedder.num_patches
+
+        if self.use_cls_token:
+            self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_size))
         # Will use fixed sin-cos embedding:
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
+        pos_embed_size = num_patches + (1 if self.use_cls_token else 0)
+        self.pos_embed = nn.Parameter(torch.zeros(1, pos_embed_size, hidden_size), requires_grad=False)
 
         self.blocks = nn.ModuleList([
             SiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
@@ -220,8 +275,15 @@ class SiT(nn.Module):
         self.apply(_basic_init)
 
         # Initialize (and freeze) pos_embed by sin-cos embedding:
-        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5))
+        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], 
+                                            int(self.x_embedder.num_patches ** 0.5), 
+                                            cls_token=self.use_cls_token)
+
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+        
+        # Initialize cls_token
+        if self.use_cls_token:
+            nn.init.normal_(self.cls_token, std=0.02)
 
         # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
         w = self.x_embedder.proj.weight.data
@@ -269,43 +331,146 @@ class SiT(nn.Module):
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
         """
-        x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
+        x = self.x_embedder(x) 
+        num_patches_input = x.shape[1]
+        num_patches_stored = self.pos_embed.shape[1]
+
+        if num_patches_input != num_patches_stored:
+            # print(f"🔍 DEBUG:")
+            # print(f"   num_patches_input: {num_patches_input}")
+            # print(f"   num_patches_stored: {num_patches_stored}")
+            # print(f"   use_cls_token: {self.use_cls_token}")
+            # print(f"   pos_embed shape: {self.pos_embed.shape}")
+            
+            # Calculate grid sizes BEFORE using them
+            if self.use_cls_token:
+                adjusted_patches_stored = num_patches_stored - 1  # Adjust for CLS token
+            else:
+                adjusted_patches_stored = num_patches_stored
+            
+            stored_grid_size = int(math.sqrt(adjusted_patches_stored))
+            input_grid_size = int(math.sqrt(num_patches_input))
+            
+            # print(f"   adjusted_patches_stored: {adjusted_patches_stored}")
+            # print(f"   stored_grid_size: {stored_grid_size}")
+            # print(f"   input_grid_size: {input_grid_size}")
+            # print(f"   stored_grid_size^2: {stored_grid_size * stored_grid_size}")
+            # print(f"   input_grid_size^2: {input_grid_size * input_grid_size}")
+            
+            # ✅ Check if grid sizes are valid
+            if stored_grid_size * stored_grid_size != adjusted_patches_stored:
+                raise ValueError(f"stored_grid_size {stored_grid_size} doesn't match adjusted_patches_stored {adjusted_patches_stored}")
+            if input_grid_size * input_grid_size != num_patches_input:
+                raise ValueError(f"input_grid_size {input_grid_size} doesn't match num_patches_input {num_patches_input}")
+
+        # ✅ FIXED: Handle CLS token logic properly
+        if self.use_cls_token:
+            # pos_embed includes CLS token, so separate them
+            pos_embed_cls = self.pos_embed[:, 0:1, :]  # CLS token embedding
+            pos_embed_patches = self.pos_embed[:, 1:, :]  # Patch embeddings only
+            num_patches_stored_for_interpolation = pos_embed_patches.shape[1]
+        else:
+            # pos_embed only contains patch embeddings
+            pos_embed_patches = self.pos_embed
+            num_patches_stored_for_interpolation = num_patches_stored
+
+        # ✅ FIXED: Interpolation logic
+        if num_patches_input != num_patches_stored_for_interpolation:
+            stored_grid_size = int(math.sqrt(num_patches_stored_for_interpolation))
+            input_grid_size = int(math.sqrt(num_patches_input))
+
+            # Reshape to 2D grid for interpolation
+            pos_embed_grid = pos_embed_patches.permute(0, 2, 1).reshape(
+                1, self.hidden_size, stored_grid_size, stored_grid_size
+            )
+            
+            # Interpolate
+            pos_embed_interpolated = F.interpolate(
+                pos_embed_grid,
+                size=(input_grid_size, input_grid_size),
+                mode='bicubic',
+                align_corners=False
+            )
+
+            # Reshape back to sequence
+            pos_embed_final = pos_embed_interpolated.reshape(
+                1, self.hidden_size, num_patches_input
+            ).permute(0, 2, 1)
+        else:
+            # Sizes match, no interpolation needed
+            pos_embed_final = pos_embed_patches
+
+        # ✅ FIXED: Add CLS token BEFORE adding positional embeddings
+        if self.use_cls_token:
+            cls_token = self.cls_token.expand(x.shape[0], -1, -1)
+            x = torch.cat((cls_token, x), dim=1)  # CLS token at position 0
+
+        # ✅ FIXED: Add positional embeddings only to patch tokens
+        if self.use_cls_token:
+            # x[:, 0] is CLS (no pos embed), x[:, 1:] are patches (get pos embed)
+            x = torch.cat([
+                x[:, 0:1],  # CLS token unchanged
+                x[:, 1:] + pos_embed_final  # Add pos embed only to patches
+            ], dim=1)
+        else:
+            # No CLS token, add pos embed to all tokens
+            x = x + pos_embed_final
+
         if self.use_time:
             t = self.t_embedder(t)                   # (N, D)
         y = self.y_embedder(y, self.training)
+
         if self.use_time:                               # (N, D)
             c = t + y
         else:
             c = y                              # (N, D)
         zs = []  # List to store projected representations at each encoder depth
-        
+        if self.capturing:
+            self.captured_activations = {}
+
         for i, block in enumerate(self.blocks):
             x = block(x, c) # (N, T, D)
+            layer_name = f'blocks.{i}'
+            is_target_layer = self.capturing and layer_name in self.capture_layers
+            
+            # ✅ Capturer l'activation brute si c'est une couche cible
+            if is_target_layer:
+                self.captured_activations[f'{layer_name}.raw'] = x.clone()
             # ✅ Check if we should collect activations at this depth
             current_depth = i
             if current_depth in self.depth_to_projector:
-                projector_idx = self.depth_to_projector[current_depth]      
-                # ✅ Check if we should use a projector for this specific depth
-                if self.use_projectors[projector_idx]:
-                    # Use projector MLP
-                    projector = self.projectors[projector_idx]
-                    if projector is not None:  # Extra safety check
-                        # Get dimensions
-                        N, T, D = x.shape
-                        # Project and reshape
-                        z = projector(x.reshape(-1, D)).reshape(N, T, -1)
-                        zs.append(z)
-                    else:
-                        # Fallback to raw activations if projector is None
-                        zs.append(x.clone())
-                else:
-                    # Return raw activations without projection
+                if self.is_teacher:
                     zs.append(x.clone())
+                else:
+                    projector_idx = self.depth_to_projector[current_depth]      
+                    # ✅ Check if we should use a projector for this specific depth
+                    if self.use_projectors[projector_idx]:
+                        # Use projector MLP
+                        projector = self.projectors[projector_idx]
+                        if projector is not None:  # Extra safety check
+                            # Get dimensions
+                            N, T, D = x.shape
+                            # Project and reshape
+                            z = projector(x.reshape(-1, D)).reshape(N, T, -1)
+                            zs.append(z)
+                            if is_target_layer:
+                                self.captured_activations[f'{layer_name}.projected'] = z.clone()
+                        else:
+                            # Fallback to raw activations if projector is None
+                            zs.append(x.clone())
+                    else:
+                        # Return raw activations without projection
+                        zs.append(x.clone())
+        cls_output = None
+        if self.use_cls_token:
+            cls_output = x[:, 0]
+            x = x[:, 1:]
+
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         if self.learn_sigma:
             x, _ = x.chunk(2, dim=1)
-        return x, zs
+        return x, zs, cls_output
 
     def forward_with_cfg(self, x, t, y, cfg_scale):
         """
@@ -327,7 +492,8 @@ class SiT(nn.Module):
 #################################################################################
 # https://github.com/facebookresearch/mae/blob/main/util/pos_embed.py
 
-def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0):
+
+def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False):
     """
     grid_size: int of the grid height and width
     return:
@@ -340,8 +506,8 @@ def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=
 
     grid = grid.reshape([2, 1, grid_size, grid_size])
     pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
-    if cls_token and extra_tokens > 0:
-        pos_embed = np.concatenate([np.zeros([extra_tokens, embed_dim]), pos_embed], axis=0)
+    if cls_token:
+        pos_embed = np.concatenate([np.zeros([1, embed_dim]), pos_embed], axis=0)
     return pos_embed
 
 

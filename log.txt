@@ -42,3 +42,5 @@
 [[34m2025-07-17 17:34:28[0m] ✅ Wandb initialisé - Projet: Sampling SiT, Run: ddp-native-test
 [[34m2025-07-17 18:21:20[0m] ✅ Checkpoint loaded with weights_only=True
 [[34m2025-07-17 18:21:23[0m] ✅ Wandb initialisé - Projet: Sampling SiT, Run: ddp-native-test
+[[34m2025-07-28 13:33:42[0m] ✅ Checkpoint loaded with weights_only=True
+[[34m2025-07-28 13:33:47[0m] ✅ Wandb initialisé - Projet: Sampling SiT, Run: ddp-native-test

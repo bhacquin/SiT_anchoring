@@ -548,7 +548,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Évaluation des caractéristiques SiT sur PASCAL VOC.")
     parser.add_argument("--model", type=str, default="SiT-B/2", help="Architecture du modèle SiT.")
-    parser.add_argument("--ckpt", type=str, required=False, default="/capstor/scratch/cscs/vbastien/SiT_anchoring/outputs/SiT-B/2/JEPA_True/Time_Cond_True/2025-07-19/Contrast_False__DivFalse_L2_False/checkpoints/epoch_finished_91_step0460368.pt", help="Chemin vers le checkpoint du modèle SiT pré-entraîné.")
+    parser.add_argument("--ckpt", type=str, required=False, default="/capstor/scratch/cscs/vbastien/SiT_anchoring/outputs/SiT-B/2/JEPA_True/Time_Cond_True/2025-07-27/Contrast_False__DivFalse_L2_False/checkpoints/epoch_finished_80_step0405324.pt")
     parser.add_argument("--data-path", type=str, default="./data", help="Chemin pour stocker le jeu de données PASCAL VOC.")
     parser.add_argument("--image-size", type=int, default=256, help="Taille de l'image sur laquelle le SiT a été entraîné.")
     # parser.add_argument("--layer-index", type=int, required=True, help="Index de la couche du Transformer à sonder.")

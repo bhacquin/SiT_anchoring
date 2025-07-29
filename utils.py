@@ -193,41 +193,45 @@ def capture_intermediate_activations(model, x, t, y, layer_names=None):
     Returns:
         Dict[str, torch.Tensor] - Activations capturées
     """
-
-    activations = {}
-    hooks = []
-
+    model_instance = model.module if hasattr(model, 'module') else model
     # Définir les couches par défaut si non spécifiées
     if layer_names is None:
-        # Prendre quelques couches représentatives
-        num_blocks = len(model.blocks) if hasattr(model, 'blocks') else 12
-        layer_names = [
-            f'blocks.{i}' for i in range(num_blocks)
-        ]
-    def make_hook(name):
-        def hook_fn(module, input, output):
-            activations[name] = output.clone().detach()
-        return hook_fn
-    
-    # Attacher les hooks
+        num_blocks = len(model_instance.blocks) if hasattr(model_instance, 'blocks') else 12
+        layer_names = [f'blocks.{i}' for i in range(num_blocks)]
+
+    # Activer le mode de capture
+    model_instance.capturing = True
+    model_instance.capture_layers = layer_names
+
     try:
-        for layer_name in layer_names:
-            layer = get_layer_by_name(model, layer_name)
-            hook = layer.register_forward_hook(make_hook(layer_name))
-            hooks.append(hook)
-        # Forward pass
         with torch.no_grad():
             _ = model(x, t, y)
-
-        return activations
+        # ✅ CORRECTION : Nettoyer les clés et retourner les activations brutes
+        raw_activations = model_instance.captured_activations.copy()
+        clean_activations = {}
+        
+        for key, activation in raw_activations.items():
+            if key.endswith('.raw'):
+                # Enlever le suffixe .raw pour correspondre à ce que attend evaluate_depth.py
+                clean_key = key.replace('.raw', '')
+                clean_activations[clean_key] = activation
+            elif key.endswith('.projected'):
+                # Pour les activations projetées, garder aussi une version sans suffixe
+                clean_key = key.replace('.projected', '')
+                if clean_key not in clean_activations:  # Priorité aux activations brutes
+                    clean_activations[clean_key] = activation
+        
+        # print(f"🔍 Activations capturées : {list(clean_activations.keys())}")
+        return clean_activations
 
     except Exception as e:
         print(f"❌ Error in capture_intermediate_activations:")
         raise
     finally:
-        # Nettoyer les hooks
-        for hook in hooks:
-            hook.remove()
+        # Toujours désactiver le mode de capture après l'opération
+        model_instance.capturing = False
+        model_instance.capture_layers = []
+        model_instance.captured_activations = {}
 
 
 def compute_entropy(x: torch.Tensor, num_bins: int = 512) -> float:

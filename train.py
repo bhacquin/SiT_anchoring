@@ -45,6 +45,7 @@ from losses import dispersive_info_nce_loss, paired_info_nce_loss
 import wandb_utils
 import wandb
 import matplotlib.pyplot as plt
+from dino_augmentation import GaussianBlur, Solarization, DataAugmentationDINO
 
 
 
@@ -515,7 +516,8 @@ def main(cfg: DictConfig):
     encoder_depth = cfg.get('encoder_depth',[3])
     use_projectors = cfg.get('use_projectors', [True])
     z_dims = cfg.get('z_dims', [768])
-
+    use_cls_token = cfg.get('use_cls_token', False) or cfg.get('use_dino_augmentation', False)
+    print(f"🌐 [Process {rank}] Using CLS token: {use_cls_token}")
     model = SiT_models[cfg.model](
                 input_size=latent_size,
                 num_classes=cfg.num_classes,
@@ -523,7 +525,8 @@ def main(cfg: DictConfig):
                 encoder_depth=encoder_depth,
                 use_projectors=use_projectors,
                 z_dims=z_dims,
-                learn_sigma=cfg.get('learn_sigma', True)
+                learn_sigma=cfg.get('learn_sigma', True),
+                use_cls_token=use_cls_token,
             )
     
     if logger:
@@ -610,12 +613,21 @@ def main(cfg: DictConfig):
                 logger.info("Loaded GradScaler state from checkpoint")
 
     # Setup data:
-    transform = transforms.Compose([
-        transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, cfg.image_size)),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
-    ])
+    use_dino_augmentation = getattr(cfg, 'use_dino_augmentation', False)
+    if use_dino_augmentation:
+        transform = DataAugmentationDINO(
+            cfg.global_crops_scale,
+            cfg.local_crops_scale,
+            cfg.local_crops_number,
+            cfg.image_size,
+        )
+    else:
+        transform = transforms.Compose([
+            transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, cfg.image_size)),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
+        ])
 
     # ✅ SETUP VALIDATION TRANSFORM (no random flip)
     test_transform = transforms.Compose([
@@ -816,30 +828,100 @@ def main(cfg: DictConfig):
         try:
             while True:
                 x, y = next(data_iter)
-                x = x.to(device)
-                y = y.to(device)             
+                if use_dino_augmentation:
+                    # print("x shape:", len(x), x[0].shape, x[-1].shape)
+                    full_x = x[0]  # Shape: [64, 3, 256, 256]
+                    global_x = torch.stack(x[1:3])  # Shape: [2, 64, 3, 224, 224] 
+                    local_x = torch.stack(x[3:])    # Shape: [8, 64, 3, 96, 96]
+                    
+                    # Move to device
+                    full_x = full_x.to(device)
+                    global_x = global_x.to(device) 
+                    local_x = local_x.to(device)
+                    # logger.info(f"Using DINO augmentation: full_x shape {full_x.shape}, global_x shape {global_x.shape}, local_x shape {local_x.shape}")
+                else:
+                    x = x.to(device)
+                    y = y.to(device)             
                 # VAE encoding (toujours en fp32)
+                # logger.info(f"y shape: {y.shape}")
                 with torch.no_grad():
                     # Map input images to latent space + normalize latents:
-                    x_clean = vae.encode(x).latent_dist.sample().mul_(0.18215)
-                
+                    if use_dino_augmentation:
+                        # Full images: y stays same size [64]
+                        y_full = y.to(device)
+                        x_full_clean = vae.encode(full_x).latent_dist.sample().mul_(0.18215)
+                        # Global crops: 2 crops per image, so y becomes [2*64 = 128]
+                        y_global = y.unsqueeze(0).repeat(2, 1).flatten().to(device)  # [2, 64] -> [128]
+                        global_x_clean = vae.encode(global_x.reshape(-1, 3, 224, 224)).latent_dist.sample().mul_(0.18215)
+
+                        # Local crops: 8 crops per image, so y becomes [8*64 = 512]  
+                        y_local = y.unsqueeze(0).repeat(8, 1).flatten().to(device)  # [8, 64] -> [512]
+                        local_x_clean = vae.encode(local_x.reshape(-1, 3, 96, 96)).latent_dist.sample().mul_(0.18215)
+
+                        x_clean_list = [x_full_clean, global_x_clean, local_x_clean]
+                        y_list = [y_full, y_global, y_local]
+                    else:
+
+                        x_clean_list = [vae.encode(x).latent_dist.sample().mul_(0.18215)]
+                        y_list = [y]
                 # ========== PERTE DE DIFFUSION + CAPTURE D'ACTIVATIONS ==========
-                model_kwargs = dict(y=y)                
-                # Déterminer le nombre d'échantillons pour le contrastive
-                k_samples = getattr(cfg, 'contrastive_num_noisy_versions', 1) if use_contrastive_loss else 1
-                if use_amp:
-                    with autocast(dtype=autocast_dtype):
+                # model_kwargs = dict(y=y)
+                total_diffusion_loss = 0.0
+                diffusion_losses = {}
+                activations = {}
+                all_activations = []  # Store activations from all crop types
+                cls_outputs_dict = {}
+                for crop_idx, (x_clean, y_crop) in enumerate(zip(x_clean_list, y_list)):
+                    model_kwargs = dict(y=y_crop)
+                    # Déterminer le nombre d'échantillons pour le contrastive
+                    k_samples = getattr(cfg, 'contrastive_num_noisy_versions', 1) if use_contrastive_loss else 1
+
+                    if use_amp:
+                        with autocast(dtype=autocast_dtype):
+                            loss_dict = transport.training_losses(
+                                model, x_clean, model_kwargs, k=k_samples
+                            )
+                            crop_diffusion_loss = loss_dict["loss"]
+                            crop_activations = loss_dict["activations"] if "activations" in loss_dict else None
+                            crop_cls_output = loss_dict["cls_output"] if "cls_output" in loss_dict else None
+                    else:
                         loss_dict = transport.training_losses(
                             model, x_clean, model_kwargs, k=k_samples
                         )
-                        diffusion_loss = loss_dict["loss"]
-                        activations = loss_dict["activations"] if "activations" in loss_dict else None
-                else:
-                    loss_dict = transport.training_losses(
-                        model, x_clean, model_kwargs, k=k_samples
-                    )
-                    diffusion_loss = loss_dict["loss"]
-                    activations = loss_dict["activations"] if "activations" in loss_dict else None
+                        crop_diffusion_loss = loss_dict["loss"]
+                        crop_activations = loss_dict["activations"] if "activations" in loss_dict else None
+                        crop_cls_output = loss_dict["cls_output"] if "cls_output" in loss_dict else None
+                    
+                    total_diffusion_loss += crop_diffusion_loss
+                    if crop_activations is not None:
+                        all_activations.extend(crop_activations)  # Accumulate activations
+                    
+                    if use_dino_augmentation:
+                        crop_names = ["full", "global", "local"]
+                        diffusion_losses[f"{crop_names[crop_idx]}_loss"] = crop_diffusion_loss.item()
+                        activations[f"{crop_names[crop_idx]}_activations"] = crop_activations
+                        cls_outputs_dict[f"{crop_names[crop_idx]}_cls_output"] = crop_cls_output
+                        if train_steps % cfg.log_every == 0 and rank == 0:
+                            logger.info(f"Crop {crop_names[crop_idx]} - Loss: {crop_diffusion_loss.item():.4f}, Shape: {x_clean.shape}")
+                    else:
+                        diffusion_losses["full"] = crop_diffusion_loss.item()
+                        activations["full"] = crop_activations
+                        cls_outputs_dict["full"] = crop_cls_output
+                        if train_steps % cfg.log_every == 0 and rank == 0:
+                            logger.info(f"Diffusion loss: {crop_diffusion_loss.item():.4f}, Shape: {x_clean.shape}")
+                    # if use_amp:
+                    #     with autocast(dtype=autocast_dtype):
+                    #         loss_dict = transport.training_losses(
+                    #             model, x_clean, model_kwargs, k=k_samples
+                    #         )
+                    #         diffusion_loss = loss_dict["loss"]
+                    #         activations = loss_dict["activations"] if "activations" in loss_dict else None
+                    # else:
+                    #     loss_dict = transport.training_losses(
+                    #         model, x_clean, model_kwargs, k=k_samples
+                    #     )
+                    #     diffusion_loss = loss_dict["loss"]
+                    #     activations = loss_dict["activations"] if "activations" in loss_dict else None
 
                 # ========== PERTE CONTRASTIVE (si activée) ==========
                 contrastive_loss = 0.0
@@ -865,18 +947,26 @@ def main(cfg: DictConfig):
                         logger.info(f"Using dispersive only contrastive loss with {k_samples} samples")
                     for i in range(len(activations)):
                         dispersive_loss += dispersive_info_nce_loss(activations[i], temperature = cfg.dispersive_temperature, norm=cfg.use_norm_in_dispersive, logger = logger, use_l2=cfg.use_l2_in_dispersive,)
-                    if logger:
+                    if logger and rank == 0:
                         logger.info(f"dispersive_loss: {dispersive_loss.item():.6f}")
 
                 elif use_contrastive_loss and k_samples == 1: ##TODO Change the way the k samples are handled probably outa batch and sg()
                     mean_pos_sim = 0.0
                     mean_neg_sim = 0.0
-                    with torch.no_grad():   
-                        t = torch.zeros((x_clean.shape[0],)).to(device) + 1.0
-                        ema_output, ema_zs = ema(x_clean, t, **model_kwargs)
+                    use_ema_for_contrastive_loss = getattr(cfg, 'use_ema_for_contrastive_loss', True)
+                    use_full_grad = getattr(cfg, 'use_full_grad', False)
+                    if not use_ema_for_contrastive_loss and use_full_grad:
+                        _, zs, cls_output = model(x_clean, t, **model_kwargs)
+                    else:
+                        with torch.no_grad():
+                            t = torch.zeros((x_clean.shape[0],)).to(device) + 0.999
+                            if use_ema_for_contrastive_loss:
+                                _, zs, cls_output = ema(x_clean, t, **model_kwargs)
+                            else:
+                                _, zs, cls_output = model(x_clean, t, **model_kwargs)
                     for i in range(len(activations)):
                         act_batch_size = activations[i].shape[0]
-                        contrastive_loss_one_latent, mean_pos_sim_one_latent, mean_neg_sim_one_latent = paired_info_nce_loss(activations[i].reshape(act_batch_size, -1), ema_zs[i].reshape(act_batch_size, -1), temperature = 0.5)
+                        contrastive_loss_one_latent, mean_pos_sim_one_latent, mean_neg_sim_one_latent = paired_info_nce_loss(activations[i].reshape(act_batch_size, -1), zs[i].reshape(act_batch_size, -1), temperature = 0.5)
                         contrastive_loss += contrastive_loss_one_latent
                         mean_pos_sim += mean_pos_sim_one_latent
                         mean_neg_sim += mean_neg_sim_one_latent
@@ -888,8 +978,9 @@ def main(cfg: DictConfig):
                 # ========== COMBINAISON DES PERTES ==========
                 contrastive_weight = getattr(cfg, 'contrastive_weight', 0.5)
                 dispersive_weight = getattr(cfg, 'dispersive_weight', 0.5)
+                diffusion_loss = total_diffusion_loss / len(x_clean_list)  # Moyenne des pertes de diffusion
                 total_loss = diffusion_loss + contrastive_weight * contrastive_loss + dispersive_weight * dispersive_loss + extra_loss
-                if logger:
+                if logger and train_steps % cfg.log_every == 0 and rank == 0:
                     logger.info(f"diffusion_loss: {diffusion_loss}, contrastive_loss: {contrastive_loss}, dispersive_loss: {dispersive_loss}, extra_loss: {extra_loss}")
                     logger.info(f"total_loss: {total_loss}")
                 # Vérification finale que total_loss est un scalaire
@@ -984,9 +1075,9 @@ def main(cfg: DictConfig):
                             log_dict.update({
                                 "train/extra_loss": avg_extra_loss
                             })
-                        for i in range(len(activations)):
-                            average_norm_per_patch = torch.norm(activations[i], dim=-1).mean().item()
-                            average_norm_per_image = torch.norm(activations[i].reshape(local_batch_size, -1), dim=-1).mean().item()
+                        for i in range(len(all_activations)):
+                            average_norm_per_patch = torch.norm(all_activations[i], dim=-1).mean().item()
+                            average_norm_per_image = torch.norm(all_activations[i].reshape(local_batch_size, -1), dim=-1).mean().item()
                             log_dict.update({f"train/activation{i}_average_": average_norm_per_patch})
                             log_msg += f", Activation{i} norm: {average_norm_per_patch}"
                             log_dict.update({f"train/activation{i}_average_norm_per_image": average_norm_per_image})
@@ -1004,7 +1095,7 @@ def main(cfg: DictConfig):
 
                         log_msg += f", LR: {current_lr:.2e}"
                         logger.info(log_msg)
-                        
+                    
                         if cfg.wandb and wandb_initialised:
                             wandb_utils.log(log_dict, step=train_steps)
                  
@@ -1013,6 +1104,11 @@ def main(cfg: DictConfig):
                     running_total_loss = 0
                     log_steps = 0
                     start_time = time()
+                                # Force cleanup every 50 steps
+                if train_steps % 50 == 0:
+                    torch.cuda.empty_cache()
+                    logger.info(f"✅ Cleaned CUDA cache at step {train_steps}")
+                
 
                 # Save SiT checkpoint:
                 if train_steps % cfg.ckpt_every == 0 and train_steps > 0:

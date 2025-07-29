@@ -147,13 +147,14 @@ class Transport:
         # Standard diffusion sampling
         t, x0, x1_current = self.sample(x_1_flat)
         t, xt, ut = self.path_sampler.plan(t, x0, x1_current)
-        model_output, zs = model(xt, t, **expanded_model_kwargs)
+        model_output, zs, cls_output = model(xt, t, **expanded_model_kwargs)
         B, *_, C = xt.shape
         assert model_output.size() == (B, *xt.size()[1:-1], C)
 
         terms = {}
         terms['pred'] = model_output
         terms['activations'] = zs if zs is not None else []
+        terms['cls_output'] = cls_output if cls_output is not None else None
         if self.model_type == ModelType.VELOCITY:
             loss = mean_flat(((model_output - ut) ** 2))
         else: 

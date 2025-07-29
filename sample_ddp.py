@@ -308,7 +308,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--model", type=str, choices=list(SiT_models.keys()), default="SiT-B/2")
     parser.add_argument("--vae",  type=str, choices=["ema", "mse"], default="ema")
-    parser.add_argument("--sample-dir", type=str, default="Samples/SiT-B/TimeConditioned/Contrastive_256_epoch49/")
+    parser.add_argument("--sample-dir", type=str, default="Samples/SiT-B/TimeConditioned/EMA_direct/")
     parser.add_argument("--per-proc-batch-size", type=int, default=256)
     parser.add_argument("--num-fid-samples", type=int, default=50_000)
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
@@ -319,7 +319,7 @@ if __name__ == "__main__":
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--tf32", action=argparse.BooleanOptionalAction, default=True,
                         help="By default, use TF32 matmuls. This massively accelerates sampling on Ampere GPUs.")
-    parser.add_argument("--ckpt", type=str, default="/capstor/scratch/cscs/vbastien/SiT_anchoring/outputs/SiT-B/2/JEPAlike_False/Time_Cond_True/2025-07-16/Contrast_True__DivFalse_L2_False/checkpoints/epoch_finished_49_step0250200.pt",
+    parser.add_argument("--ckpt", type=str, default="/capstor/scratch/cscs/vbastien/SiT_anchoring/outputs/SiT-B/2/JEPA_True/Time_Cond_True/2025-07-27/Contrast_False__DivFalse_L2_False/checkpoints/epoch_finished_80_step0405324.pt",
                         help="Optional path to a SiT checkpoint (default: auto-download a pre-trained SiT-XL/2 model).")
 
     parse_transport_args(parser)
